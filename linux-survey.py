@@ -364,6 +364,35 @@ def survey_users():
         except KeyError:
             pass
 
+def survey_system_config_files():
+    section("System Configuration Files")
+
+    config_files = [
+        ("/etc/passwd", "User Accounts"),
+        ("/etc/shadow", "Password Hashes (requires root)"),
+        ("/etc/group", "Group Definitions"),
+        ("/etc/fstab", "Filesystem Table"),
+    ]
+
+    for filepath, label in config_files:
+        report(f"\n  --- {filepath} ({label}) ---")
+        if not os.path.exists(filepath):
+            report(f"    (file not found)")
+            continue
+        if not os.access(filepath, os.R_OK):
+            report(f"    (permission denied — run as root to read)")
+            continue
+        try:
+            with open(filepath, "r", errors="replace") as f:
+                line_count = 0
+                for line in f:
+                    report(f"    {line.rstrip()}")
+                    line_count += 1
+                if line_count == 0:
+                    report(f"    (file is empty)")
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            report(f"    (error reading: {e})")
+
 def survey_services():
     section("Init System & Services")
     init_type = "Unknown"
@@ -894,6 +923,34 @@ def survey_mounts_shm():
     except (PermissionError, FileNotFoundError, OSError):
         report("  (could not read /proc/mounts)")
 
+    # Network / remote mounts (NFS, CIFS/SMB, sshfs, etc.)
+    NETWORK_FS_TYPES = frozenset([
+        "nfs", "nfs4", "cifs", "smbfs", "sshfs", "fuse.sshfs",
+        "ncpfs", "afs", "coda", "gfs", "gfs2", "glusterfs",
+        "lustre", "9p", "fuse.rclone",
+    ])
+    section("Network & Remote Mounts")
+    found_net = False
+    try:
+        with open("/proc/mounts", "r") as f:
+            report(f"  {pad('Device/Remote', 40)}{pad('Mount Point', 30)}{pad('Type', 12)}Options")
+            report(f"  {pad('-------------', 40)}{pad('-----------', 30)}{pad('----', 12)}-------")
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4:
+                    device = parts[0]
+                    mpoint = parts[1]
+                    fstype = parts[2]
+                    options = parts[3]
+                    # Match by filesystem type or by remote-looking device (host:path or //host/share)
+                    if fstype in NETWORK_FS_TYPES or device.startswith("//") or ":" in device and "/" in device.split(":", 1)[1]:
+                        report(f"  {pad(device, 40)}{pad(mpoint, 30)}{pad(fstype, 12)}{options}")
+                        found_net = True
+    except (PermissionError, FileNotFoundError, OSError):
+        report("  (could not read /proc/mounts)")
+    if not found_net:
+        report("  No network or remote mounts detected.")
+
 def survey_systemd_services():
     section("Systemd Services (/etc/systemd/system)")
     sysd_dir = "/etc/systemd/system"
@@ -1043,14 +1100,17 @@ def survey_recently_modified_files():
     MAX_RESULTS = 100
 
     def _scan_with_find():
-        """Use find command. Returns (lines, error_msg) tuple."""
+        """Use find command with -printf for timestamps. Returns (entries, error_msg) tuple.
+        Each entry is a (timestamp_str, filepath) tuple."""
+        # %TY-%Tm-%Td %TT gives ISO-style modification time, \t separates from path
         cmd = [
             "find", "/",
             "-path", "/proc", "-prune", "-o",
             "-path", "/sys", "-prune", "-o",
             "-path", "/dev", "-prune", "-o",
             "-path", "/run", "-prune", "-o",
-            "-type", "f", "-mmin", "-60", "-print"
+            "-type", "f", "-mmin", "-60",
+            "-printf", "%TY-%Tm-%Td %TH:%TM:%TS\\t%p\\n"
         ]
         # Use Popen instead of check_output: find returns exit code 1 on
         # permission-denied directories, which makes check_output throw
@@ -1070,7 +1130,8 @@ def survey_recently_modified_files():
             return stdout, "Scan timed out after 120 seconds (partial results shown)"
 
     def _scan_with_walk():
-        """Pure Python fallback using os.walk."""
+        """Pure Python fallback using os.walk. Returns (entries, error_msg) tuple.
+        Each entry is a (timestamp_str, filepath) tuple."""
         cutoff = time.time() - 3600
         results = []
         for root, dirs, files in os.walk("/", topdown=True):
@@ -1081,29 +1142,46 @@ def survey_recently_modified_files():
                     return results, None
                 fpath = os.path.join(root, fname)
                 try:
-                    if os.lstat(fpath).st_mtime >= cutoff:
-                        results.append(fpath)
+                    mtime = os.lstat(fpath).st_mtime
+                    if mtime >= cutoff:
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+                        results.append((ts, fpath))
                 except (PermissionError, FileNotFoundError, OSError):
                     pass
         return results, None
 
-    output = None
+    entries = []
     error_msg = None
-    lines = []
 
     # Try find first, fall back to os.walk
     try:
         output, error_msg = _scan_with_find()
         if output:
-            lines = [l.strip() for l in output.strip().split("\n") if l.strip()]
+            for raw_line in output.strip().split("\n"):
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                # find -printf produces: "YYYY-MM-DD HH:MM:SS.nnn\tpath"
+                parts = raw_line.split("\t", 1)
+                if len(parts) == 2:
+                    # Truncate fractional seconds to whole seconds
+                    ts = parts[0]
+                    dot = ts.rfind(".")
+                    if dot != -1:
+                        ts = ts[:dot]
+                    entries.append((ts, parts[1]))
+                else:
+                    entries.append(("", raw_line))
     except OSError:
         # find not available, use os.walk
-        walk_results, error_msg = _scan_with_walk()
-        lines = walk_results
+        entries, error_msg = _scan_with_walk()
+
+    report(f"  {pad('Modified', 22)}Path")
+    report(f"  {pad('--------', 22)}----")
 
     count = 0
-    for line in lines:
-        report(f"  {line}")
+    for ts, fpath in entries:
+        report(f"  {pad(ts, 22)}{fpath}")
         count += 1
         if count >= MAX_RESULTS:
             report(f"  [!] Output capped at {MAX_RESULTS} files.")
@@ -1300,6 +1378,7 @@ def main():
         ("arp", survey_arp),
         ("listening_ports", survey_listening_ports),
         ("users", survey_users),
+        ("system_config_files", survey_system_config_files),
         ("recent_logins", survey_recent_logins),
         ("services", survey_services),
         ("systemd_services", survey_systemd_services),

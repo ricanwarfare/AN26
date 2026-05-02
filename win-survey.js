@@ -274,6 +274,77 @@ function SurveyUsers() {
     });
 }
 
+function SurveySystemConfigFiles() {
+    // Windows equivalent of /etc/passwd — detailed local user accounts
+    Section("User Accounts (Detailed)");
+    Log(Pad("  Name", 22) + Pad("SID", 48) + Pad("Disabled", 10) + Pad("Locked", 10) + Pad("PasswordReq", 13) + "FullName");
+    Log(Pad("  ----", 22) + Pad("---", 48) + Pad("--------", 10) + Pad("------", 10) + Pad("-----------", 13) + "--------");
+    QueryWMI("SELECT * FROM Win32_UserAccount WHERE LocalAccount = TRUE", function(item) {
+        var disabled = item.Disabled ? "Yes" : "No";
+        var locked = item.Lockout ? "Yes" : "No";
+        var pwReq = item.PasswordRequired ? "Yes" : "No";
+        var fullName = item.FullName || "";
+        Log(Pad("  " + item.Name, 22) + Pad(item.SID, 48) + Pad(disabled, 10) + Pad(locked, 10) + Pad(pwReq, 13) + fullName);
+    });
+
+    // Windows equivalent of /etc/shadow — password and lockout policies
+    Section("Password & Account Policies");
+    try {
+        var netAccounts = RunCommand("net accounts", 10000);
+        if (netAccounts.length > 0) {
+            var lines = netAccounts.split('\n');
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].replace(/\r/g, "").replace(/^\s+|\s+$/g, "");
+                if (line.length > 0 && line.indexOf("---") === -1 && line.indexOf("completed") === -1) {
+                    Log("  " + line);
+                }
+            }
+        } else {
+            Log("  (net accounts not available)");
+        }
+    } catch (e) {
+        Log("  Error querying account policies: " + e.message);
+    }
+
+    // Windows equivalent of /etc/group — all local groups and their members
+    Section("Local Groups & Members");
+    QueryWMI("SELECT * FROM Win32_Group WHERE LocalAccount = TRUE", function(group) {
+        var memberList = [];
+        var query = "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='" + group.Domain + "',Name='" + group.Name + "'\"";
+        try {
+            var items = wmi.ExecQuery(query);
+            var enumItems = new Enumerator(items);
+            for (; !enumItems.atEnd(); enumItems.moveNext()) {
+                var assoc = enumItems.item();
+                var memberPath = assoc.PartComponent;
+                var nameMatch = memberPath.match(/Name="([^"]+)"/);
+                if (nameMatch) {
+                    memberList.push(nameMatch[1]);
+                }
+            }
+        } catch (e) { /* ignore query errors for individual groups */ }
+        var members = memberList.length > 0 ? memberList.join(", ") : "(no members)";
+        Log("  " + Pad(group.Name, 30) + "SID: " + Pad(group.SID, 20) + " Members: " + members);
+    });
+
+    // Windows equivalent of /etc/fstab — disk/volume configuration
+    Section("Disk & Volume Configuration");
+    Log(Pad("  Drive", 8) + Pad("Type", 18) + Pad("FileSystem", 12) + Pad("Size", 12) + Pad("Free", 12) + "VolumeName");
+    Log(Pad("  -----", 8) + Pad("----", 18) + Pad("----------", 12) + Pad("----", 12) + Pad("----", 12) + "----------");
+    var driveTypeMap = {
+        0: "Unknown", 1: "No Root Dir", 2: "Removable",
+        3: "Local Disk", 4: "Network Drive", 5: "CD-ROM", 6: "RAM Disk"
+    };
+    QueryWMI("SELECT * FROM Win32_LogicalDisk", function(item) {
+        var driveType = driveTypeMap[item.DriveType] || "Unknown";
+        var fs = item.FileSystem || "N/A";
+        var totalGB = (item.Size !== null && item.Size !== undefined) ? Math.round(item.Size / 1073741824) + " GB" : "N/A";
+        var freeGB = (item.FreeSpace !== null && item.FreeSpace !== undefined) ? Math.round(item.FreeSpace / 1073741824) + " GB" : "N/A";
+        var volName = item.VolumeName || "";
+        Log(Pad("  " + item.DeviceID, 8) + Pad(driveType, 18) + Pad(fs, 12) + Pad(totalGB, 12) + Pad(freeGB, 12) + volName);
+    });
+}
+
 var shellCompanyIndex = -1;
 var globalShellApp = null;
 var namespaceCache = {};
@@ -1172,6 +1243,73 @@ function SurveyRecentlyModifiedFiles() {
     }
 }
 
+function SurveyMountedShares() {
+    Section("Mounted Network Shares & Mapped Drives");
+
+    // 1. Mapped network drives via WScript.Network
+    var foundAny = false;
+    try {
+        var net = new ActiveXObject("WScript.Network");
+        var drives = net.EnumNetworkDrives();
+        if (drives.Count > 0) {
+            Log(Pad("  Drive", 10) + "Remote Path");
+            Log(Pad("  -----", 10) + "-----------");
+            // EnumNetworkDrives returns pairs: [0]=drive letter, [1]=UNC path, [2]=drive, [3]=UNC, ...
+            for (var i = 0; i < drives.Count; i += 2) {
+                var driveLetter = drives.Item(i) || "(none)";
+                var uncPath = drives.Item(i + 1) || "N/A";
+                Log(Pad("  " + driveLetter, 10) + uncPath);
+                foundAny = true;
+            }
+        }
+    } catch (e) {
+        Log("  Error enumerating mapped drives: " + e.message);
+    }
+
+    // 2. WMI: Win32_LogicalDisk where DriveType=4 (Network Drive)
+    try {
+        QueryWMI("SELECT * FROM Win32_LogicalDisk WHERE DriveType = 4", function(item) {
+            if (!foundAny) {
+                Log(Pad("  Drive", 10) + Pad("Remote Path", 45) + Pad("FileSystem", 12) + "Free/Total");
+                Log(Pad("  -----", 10) + Pad("-----------", 45) + Pad("----------", 12) + "----------");
+                foundAny = true;
+            }
+            var freeGB = (item.FreeSpace !== null) ? Math.round(item.FreeSpace / 1073741824) + " GB" : "N/A";
+            var totalGB = (item.Size !== null) ? Math.round(item.Size / 1073741824) + " GB" : "N/A";
+            var remote = item.ProviderName || "N/A";
+            var fs = item.FileSystem || "N/A";
+            Log(Pad("  " + item.DeviceID, 10) + Pad(remote, 45) + Pad(fs, 12) + freeGB + " / " + totalGB);
+        });
+    } catch (e) {
+        Log("  Error querying WMI for network disks: " + e.message);
+    }
+
+    // 3. net use output as supplemental source (catches persistent but disconnected mappings)
+    try {
+        var netUseOut = RunCommand("net use", 10000);
+        if (netUseOut.length > 0) {
+            var lines = netUseOut.split('\n');
+            var hasEntries = false;
+            for (var j = 0; j < lines.length; j++) {
+                var line = lines[j].replace(/\r/g, "").replace(/^\s+|\s+$/g, "");
+                // Lines with share data contain status like OK, Disconnected, etc.
+                if (line.indexOf("OK") !== -1 || line.indexOf("Disconnected") !== -1 || line.indexOf("Unavailable") !== -1) {
+                    if (!hasEntries) {
+                        Log("\n  net use (including disconnected/persistent):");
+                        hasEntries = true;
+                    }
+                    Log("    " + line);
+                    foundAny = true;
+                }
+            }
+        }
+    } catch (e) { /* net use not available */ }
+
+    if (!foundAny) {
+        Log("  No mapped network drives or mounted shares detected.");
+    }
+}
+
 function SurveyAnomalyDetection() {
     Section("Anomaly Detection (Threat Hunting)");
     var findings = [];
@@ -1356,6 +1494,7 @@ try {
     SurveySystemInfo();
     SurveyNetwork();
     SurveyUsers();
+    SurveySystemConfigFiles();
     SurveyProcesses();
     SurveyServices();
     SurveyStartup();
@@ -1369,6 +1508,7 @@ try {
     SurveyRemoteAccess();
     SurveyDrivers();
     SurveyNeighbors();
+    SurveyMountedShares();
     SurveyFirewall();
     SurveyHostsFile();
     SurveyDNSCache();

