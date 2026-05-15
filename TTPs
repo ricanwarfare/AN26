@@ -1,0 +1,89 @@
+ZERO CACHE
+
+
+Method 1: Using Group Policy (Recommended)
+This is the most efficient way to apply the setting across multiple machines in a domain.
+
+Open the Group Policy Management Console (gpmc.msc).
+
+Create a new GPO or edit an existing one linked to the desired Organizational Unit (OU).
+
+Navigate to:
+Computer Configuration > Windows Settings > Security Settings > Local Policies > Security Options
+
+Locate the policy: Interactive logon: Number of previous logons to cache (in case domain controller is not available).
+
+Check Define this policy setting and set the value to 0.
+
+Run gpupdate /force on the target machines to apply the change.
+
+
+
+
+
+============================================================================================================================================
+
+
+SMART CARD LOCKOUT
+
+Step 1: Configuration via GPO (The Domain Level)
+To apply this across the board, you use the Default Domain Policy:
+
+Open Group Policy Management (gpmc.msc).
+
+Expand your forest and domain, right-click Default Domain Policy, and select Edit.
+
+Navigate to:
+
+Computer Configuration > Policies > Windows Settings > Security Settings > Local Policies > Security Options
+
+Find the policy: Interactive logon: Require smart card (In newer versions of Windows, it may be labeled Interactive logon: Require Windows Hello for Business or smart card).
+
+Set it to Enabled.
+
+Click Apply and OK
+
+
+
+=================================================================================================================================================
+
+
+CHANGE USER PASSWORDS including local account on DC
+
+
+1. Active Directory Users and Computers (GUI)
+This is the standard method for most admins.
+
+Open Active Directory Users and Computers (dsa.msc).
+
+Locate the user in their respective Organizational Unit (OU).
+
+Right-click the user and select Reset Password....
+
+Enter the new password and confirm it.
+
+Optional: Check "User must change password at next logon" (Note: This will not work if "Smart Card is Required" is enabled, as the user won't be able to provide a "current" password they don't know).
+
+
+
+====================================================================================================================================================
+
+
+FORCE GPO UPDATE
+
+
+Method 1: Group Policy Management Console (GUI)
+This is the easiest way to target an entire Organizational Unit (OU) at once.
+
+Open Group Policy Management (gpmc.msc).
+
+Right-click the OU containing the computers you want to update.
+
+Select Group Policy Update....
+
+A confirmation window will appear showing how many computers are in that OU. Click Yes.
+
+What happens next: Windows will remotely schedule a task on every computer in that OU to run gpupdate /force within the next 0 to 10 minutes. This staggered start prevents your network from being slammed by every PC hitting the DC at the exact same second.
+
+
+
